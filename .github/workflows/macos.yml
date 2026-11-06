@@ -36,7 +36,7 @@ jobs:
           .venv/bin/pip install --quiet --disable-pip-version-check "libclang==18.1.1"
           .venv/bin/python -c "import clang.cindex as c; c.Index.create(); print('libclang ok')"
 
-           - name: Desligar os static_assert do leitor de tela (libclang 18 no arm64)
+      - name: Contornar o static_assert do leitor de tela (libclang 18 no arm64)
         run: |
           perl -0pi -e 's/#include <stddef.h>/#include <stddef.h>\n#define _Static_assert(...)/' port/src/a11y_game.c
           grep -n "define _Static_assert" port/src/a11y_game.c
