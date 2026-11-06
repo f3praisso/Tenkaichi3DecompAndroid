@@ -23,6 +23,8 @@ jobs:
           #import <dlfcn.h>
           #import <errno.h>
           #import <os/proc.h>
+          #import <mach/mach.h>
+          #import <mach/vm_map.h>
 
           #define GB4 (4ULL << 30)
           #define L(...) do { [s appendFormat:__VA_ARGS__]; [s appendString:@"\n"]; } while (0)
@@ -30,6 +32,13 @@ jobs:
           typedef int (*init_t)(void **);
           typedef int (*flags_t)(void **, short);
           typedef int (*spawn_t)(pid_t *, const char *, const void *, void *const *, char *const[], char *const[]);
+
+          static int resv(uint64_t addr, uint64_t size) { /* reserva fixa sem acesso, sem sobrescrever; libera em seguida */
+            vm_address_t a = (vm_address_t)addr;
+            kern_return_t k = vm_map(mach_task_self(), &a, (vm_size_t)size, 0, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+            if (k == KERN_SUCCESS) { vm_deallocate(mach_task_self(), a, (vm_size_t)size); return 0; }
+            return (int)k;
+          }
 
           static NSString *report(void) {
             NSMutableString *s = [NSMutableString string];
@@ -49,30 +58,28 @@ jobs:
             L(@"  janela alinhada em 4 GB: %@", ((hv - 0x20000000ULL) & 0xFFFFFFFFULL) == 0 ? @"SIM" : @"NAO");
             L(@"");
 
-            L(@"2) Reservar 4 GB em endereco alinhado");
-            uint64_t firstOk = 0;
-            for (int sh = 32; sh <= 40; sh++) {
-              uint64_t want = 1ULL << sh;
-              void *p = mmap((void *)want, GB4, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-              if (p == MAP_FAILED) { L(@"  0x%llx: falhou (errno %d)", want, errno); continue; }
-              L(@"  0x%llx: %@ (obtido 0x%llx)", want, (uint64_t)p == want ? @"OK" : @"outro endereco", (uint64_t)p);
-              if ((uint64_t)p == want && !firstOk) firstOk = want; else munmap(p, GB4);
+            L(@"2) Reservas com endereco FIXO (4 GB cada, multiplos de 4 GB)");
+          {
+            int prev = 0; uint64_t from = 1;
+            for (uint64_t k = 1; k <= 0x80; k++) {
+              int ok = (k < 0x80) && resv(k << 32, GB4) == 0;
+              if (k == 1) { prev = ok; continue; }
+              if (ok != prev || k == 0x80) {
+                L(@"  0x%llx - 0x%llx: %@", from << 32, k << 32, prev ? @"livre" : @"ocupado/recusado");
+                from = k; prev = ok;
+              }
             }
-            if (firstOk) {
-              uint8_t *w = (uint8_t *)firstOk;
-              int r = mprotect(w + 0x20000000, 64 << 20, PROT_READ | PROT_WRITE);
-              if (r == 0) { memset(w + 0x20000000, 0xA5, 64 << 20); L(@"  usar 64 MB dentro da janela: OK"); }
-              else L(@"  usar 64 MB dentro da janela: falhou (errno %d)", errno);
-              munmap(w, GB4);
-            } else {
-              L(@"  nenhuma reserva alinhada funcionou");
-            }
-            void *big = mmap(NULL, 2 * GB4, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            if (big == MAP_FAILED) L(@"  8 GB em qualquer lugar: falhou (errno %d)", errno);
-            else { L(@"  8 GB em qualquer lugar: 0x%llx", (uint64_t)big); munmap(big, 2 * GB4); }
-            L(@"");
+          }
+          L(@"  maior reserva unica em qualquer lugar:");
+          for (uint64_t g = 4; g <= 8; g++) {
+            vm_address_t a = 0;
+            kern_return_t kr = vm_map(mach_task_self(), &a, (vm_size_t)(g << 30), 0, VM_FLAGS_ANYWHERE, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+            if (kr == KERN_SUCCESS) { L(@"    %llu GB: ok em 0x%llx", g, (uint64_t)a); vm_deallocate(mach_task_self(), a, (vm_size_t)(g << 30)); }
+            else L(@"    %llu GB: falhou (%d)", g, (int)kr);
+          }
+          L(@"");
 
-            L(@"3) Reiniciar sem ASLR (posix_spawn)");
+          L(@"3) Reiniciar sem ASLR (posix_spawn)");
             init_t ai = (init_t)dlsym(RTLD_DEFAULT, "posix_spawnattr_init");
             flags_t af = (flags_t)dlsym(RTLD_DEFAULT, "posix_spawnattr_setflags");
             spawn_t sp = (spawn_t)dlsym(RTLD_DEFAULT, "posix_spawn");
@@ -95,7 +102,19 @@ jobs:
             L(@"  pagina: %d bytes", (int)getpagesize());
             L(@"  RAM: %llu MB", mem >> 20);
             L(@"  disponivel ao app: %lu MB", (unsigned long)(os_proc_available_memory() >> 20));
-            return s;
+            L(@"");
+          L(@"5) Janela W = cabecalho - 0x20000000 (sem exigir alinhamento)");
+          {
+            uint64_t W = hv - 0x20000000ULL;
+            L(@"  W = 0x%llx", W);
+            if (W < 0x100000000ULL) {
+              L(@"  W abaixo de 4 GB: area proibida do programa");
+            } else {
+              L(@"  [W+0x00100000, +0x1EF00000): %@", resv(W + 0x00100000ULL, 0x1EF00000ULL) == 0 ? @"livre" : @"ocupado");
+              L(@"  [W+0x30000000, +0x41000000): %@", resv(W + 0x30000000ULL, 0x41000000ULL) == 0 ? @"livre" : @"ocupado");
+            }
+          }
+          return s;
           }
 
           @interface VC : UIViewController @end
@@ -165,7 +184,17 @@ jobs:
             otool -l "out/$name/Payload/$name.app/$name" | grep -A3 "segname __TEXT" | head -4
           }
           build AslrA
-          build AslrB -Wl,-segaddr,__TEXT,0x1020000000 || echo "::warning::AslrB nao ligou com -segaddr (veja o log acima)"
+          # AslrB: como o link.py do port de macOS, cada segmento recebe um endereco (-segaddr), mantendo as distancias
+          otool -l out/AslrA/Payload/AslrA.app/AslrA | awk '/segname/{n=$2} /vmaddr/{if(n!=""){print n, $2; n=""}}' > segs.txt
+          cat segs.txt
+          FIRST=$(awk '$1=="__TEXT"{print $2}' segs.txt)
+          FLAGS=()
+          while read -r seg addr; do
+            case "$seg" in __PAGEZERO|__LINKEDIT) continue;; esac
+            FLAGS+=("-Wl,-segaddr,$seg,$(printf '0x%x' $(( 0x1020000000 + addr - FIRST )))")
+          done < segs.txt
+          echo "flags: ${FLAGS[@]}"
+          build AslrB "${FLAGS[@]}" || echo "::warning::AslrB nao ligou com -segaddr (veja o log acima)"
           ls -la out/*.ipa
 
       - uses: actions/upload-artifact@v4
