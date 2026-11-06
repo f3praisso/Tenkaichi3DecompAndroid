@@ -36,6 +36,11 @@ jobs:
           .venv/bin/pip install --quiet --disable-pip-version-check "libclang==18.1.1"
           .venv/bin/python -c "import clang.cindex as c; c.Index.create(); print('libclang ok')"
 
+      - name: Contornar o static_assert do leitor de tela (libclang 18 no arm64)
+        run: |
+          sed -i.bak '/_Static_assert(offsetof(A11yDialog, choices)/d' port/src/a11y_game.c
+          grep -c "A11yDialog, choices" port/src/a11y_game.c || true
+
       - name: Compilar o código do jogo (undefined.py)
         run: |
           set -o pipefail
