@@ -45,6 +45,10 @@ jobs:
             char model[64] = "?"; size_t ml = sizeof model;
             sysctlbyname("hw.machine", model, &ml, NULL, 0);
             L(@"%s  iOS %@", model, UIDevice.currentDevice.systemVersion);
+          {
+            NSString *m = [NSUserDefaults.standardUserDefaults stringForKey:@"m6"];
+            if (m && ![m isEqualToString:@"concluido"]) L(@"!! o teste 6 anterior travou no passo: %@", m);
+          }
             L(@"");
 
             const struct mach_header *h = _dyld_get_image_header(0);
@@ -117,7 +121,81 @@ jobs:
           return s;
           }
 
-          @interface VC : UIViewController @end
+          static volatile int gShared = 5;
+          __attribute__((noinline)) int probe42(void) { return 42; }
+          __attribute__((noinline)) int readShared(void) { return gShared; }
+          __attribute__((noinline)) void writeShared(int v) { gShared = v; }
+
+          static void mark(const char *step) {
+            [NSUserDefaults.standardUserDefaults setObject:@(step) forKey:@"m6"];
+            [NSUserDefaults.standardUserDefaults synchronize];
+          }
+
+          typedef struct { uint64_t vm, size; char name[17]; } Seg;
+
+          /* Teste 6: janela alinhada separada + espelho do proprio programa dentro dela (vm_remap), e chamar codigo pelo espelho */
+          static NSString *mirrorTest(void) {
+            NSMutableString *s = [NSMutableString string];
+            const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+            Seg seg[8]; int n = 0;
+            uint64_t lo = ~0ULL;
+            const uint8_t *p = (const uint8_t *)(h + 1);
+            for (uint32_t i = 0; i < h->ncmds; i++) {
+              const struct load_command *lc = (const struct load_command *)p;
+              if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+                if (strcmp(sc->segname, "__PAGEZERO") && strcmp(sc->segname, "__LINKEDIT") && n < 8) {
+                  seg[n].vm = sc->vmaddr + (uint64_t)slide; seg[n].size = sc->vmsize;
+                  memcpy(seg[n].name, sc->segname, 16); seg[n].name[16] = 0;
+                  if (seg[n].vm < lo) lo = seg[n].vm;
+                  n++;
+                }
+              }
+              p += lc->cmdsize;
+            }
+            L(@"6) Janela alinhada separada + espelho do programa");
+            for (int i = 0; i < n; i++) L(@"  segmento %s: 0x%llx, %llu KB", seg[i].name, seg[i].vm, seg[i].size >> 10);
+
+            mark("reservar 6 GB");
+            vm_address_t base = 0; vm_size_t total = (vm_size_t)(6ULL << 30);
+            kern_return_t kr = vm_map(mach_task_self(), &base, total, 0, VM_FLAGS_ANYWHERE, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+            if (kr != KERN_SUCCESS) { L(@"  reserva de 6 GB falhou (%d)", (int)kr); mark("concluido"); return s; }
+            uint64_t W = ((uint64_t)base + GB4 - 1) & ~(GB4 - 1);
+            uint64_t after = (uint64_t)base + total - W;
+            L(@"  reserva 0x%llx, W alinhado = 0x%llx, sobram %llu MB depois de W", (uint64_t)base, W, after >> 20);
+            if (after < 0x80000000ULL) { L(@"  nao sobram 2 GB depois de W"); mark("concluido"); return s; }
+
+            uint64_t alias0 = W + 0x20000000ULL;
+            for (int i = 0; i < n; i++) {
+              mark(seg[i].name);
+              vm_address_t dst = (vm_address_t)(alias0 + (seg[i].vm - lo));
+              vm_prot_t cur = 0, mx = 0;
+              kr = vm_remap(mach_task_self(), &dst, (vm_size_t)seg[i].size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)seg[i].vm, FALSE, &cur, &mx, VM_INHERIT_NONE);
+              L(@"  espelhar %s em 0x%llx: %@ (cur=%d max=%d)", seg[i].name, (uint64_t)dst, kr == KERN_SUCCESS ? @"OK" : [NSString stringWithFormat:@"FALHOU %d", (int)kr], (int)cur, (int)mx);
+              if (kr != KERN_SUCCESS) { mark("concluido"); return s; }
+            }
+
+            typedef int (*fn0)(void);
+            mark("chamar probe42 pelo espelho");
+            int r = ((fn0)(alias0 + ((uintptr_t)probe42 - lo)))();
+            L(@"  probe42 pelo espelho: %d (esperado 42)", r);
+
+            gShared = 77;
+            mark("chamar readShared pelo espelho");
+            r = ((fn0)(alias0 + ((uintptr_t)readShared - lo)))();
+            L(@"  readShared pelo espelho: %d (esperado 77 se os dados sao compartilhados)", r);
+
+            mark("chamar writeShared pelo espelho");
+            ((void (*)(int))(alias0 + ((uintptr_t)writeShared - lo)))(99);
+            L(@"  gShared no original apos writeShared(99) pelo espelho: %d (esperado 99)", (int)gShared);
+            mark("concluido");
+            return s;
+          }
+
+          @interface VC : UIViewController
+          @property (strong) UITextView *tv;
+          @end
           @implementation VC
           - (void)viewDidLoad {
             [super viewDidLoad];
@@ -128,9 +206,22 @@ jobs:
             t.textColor = UIColor.greenColor;
             t.editable = NO;
             t.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-            t.textContainerInset = UIEdgeInsetsMake(50, 8, 8, 8);
+            t.textContainerInset = UIEdgeInsetsMake(50, 8, 90, 8);
             t.text = report();
             [self.view addSubview:t];
+            self.tv = t;
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+            [b setTitle:@"Rodar teste 6 (espelhar o programa)" forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+            b.frame = CGRectMake(0, self.view.bounds.size.height - 80, self.view.bounds.size.width, 44);
+            b.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+            [b addTarget:self action:@selector(run6) forControlEvents:UIControlEventTouchUpInside];
+            [self.view addSubview:b];
+          }
+          - (void)run6 {
+            NSString *r = mirrorTest();
+            self.tv.text = [self.tv.text stringByAppendingFormat:@"\n%@", r];
+            [self.tv scrollRangeToVisible:NSMakeRange(self.tv.text.length - 1, 1)];
           }
           @end
 
@@ -194,7 +285,10 @@ jobs:
             FLAGS+=("-Wl,-segaddr,$seg,$(printf '0x%x' $(( 0x1020000000 + addr - FIRST )))")
           done < segs.txt
           echo "flags: ${FLAGS[@]}"
-          build AslrB "${FLAGS[@]}" || echo "::warning::AslrB nao ligou com -segaddr (veja o log acima)"
+          # sem "chained fixups" (o ld recente quebra com -segaddr nelas); o port de macOS usa target 11, que ja evita isso
+          build AslrB "${FLAGS[@]}" -Wl,-no_fixup_chains \
+            || build AslrB "${FLAGS[@]}" -Wl,-no_fixup_chains -miphoneos-version-min=12.0 \
+            || echo "::warning::AslrB nao ligou com -segaddr (veja o log acima)"
           ls -la out/*.ipa
 
       - uses: actions/upload-artifact@v4
