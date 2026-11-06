@@ -150,7 +150,7 @@ jobs:
           </dict></plist>
           EOF
 
-      - name: Compilar e empacotar (A: ligacao normal, B: __TEXT em 0x1020000000)
+      - name: Compilar e empacotar (AslrA normal, AslrB com TEXT em 0x1020000000)
         run: |
           cd t
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
