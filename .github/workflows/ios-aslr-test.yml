@@ -1,0 +1,175 @@
+name: ios-aslr-test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Escrever o app de teste
+        run: |
+          mkdir -p t && cd t
+          cat > main.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <mach-o/dyld.h>
+          #import <mach-o/loader.h>
+          #import <sys/mman.h>
+          #import <sys/sysctl.h>
+          #import <sys/wait.h>
+          #import <unistd.h>
+          #import <string.h>
+          #import <dlfcn.h>
+          #import <errno.h>
+          #import <os/proc.h>
+
+          #define GB4 (4ULL << 30)
+          #define L(...) do { [s appendFormat:__VA_ARGS__]; [s appendString:@"\n"]; } while (0)
+
+          typedef int (*init_t)(void **);
+          typedef int (*flags_t)(void **, short);
+          typedef int (*spawn_t)(pid_t *, const char *, const void *, void *const *, char *const[], char *const[]);
+
+          static NSString *report(void) {
+            NSMutableString *s = [NSMutableString string];
+            char model[64] = "?"; size_t ml = sizeof model;
+            sysctlbyname("hw.machine", model, &ml, NULL, 0);
+            L(@"%s  iOS %@", model, UIDevice.currentDevice.systemVersion);
+            L(@"");
+
+            const struct mach_header *h = _dyld_get_image_header(0);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+            uint64_t hv = (uint64_t)(uintptr_t)h;
+            L(@"1) Onde o programa foi carregado");
+            L(@"  cabecalho: 0x%llx", hv);
+            L(@"  slide ASLR: 0x%lx", (long)slide);
+            L(@"  endereco de ligacao: 0x%llx", hv - (uint64_t)slide);
+            L(@"  32 bits baixos do cabecalho: 0x%08llx", hv & 0xFFFFFFFFULL);
+            L(@"  janela alinhada em 4 GB: %@", ((hv - 0x20000000ULL) & 0xFFFFFFFFULL) == 0 ? @"SIM" : @"NAO");
+            L(@"");
+
+            L(@"2) Reservar 4 GB em endereco alinhado");
+            uint64_t firstOk = 0;
+            for (int sh = 32; sh <= 40; sh++) {
+              uint64_t want = 1ULL << sh;
+              void *p = mmap((void *)want, GB4, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+              if (p == MAP_FAILED) { L(@"  0x%llx: falhou (errno %d)", want, errno); continue; }
+              L(@"  0x%llx: %@ (obtido 0x%llx)", want, (uint64_t)p == want ? @"OK" : @"outro endereco", (uint64_t)p);
+              if ((uint64_t)p == want && !firstOk) firstOk = want; else munmap(p, GB4);
+            }
+            if (firstOk) {
+              uint8_t *w = (uint8_t *)firstOk;
+              int r = mprotect(w + 0x20000000, 64 << 20, PROT_READ | PROT_WRITE);
+              if (r == 0) { memset(w + 0x20000000, 0xA5, 64 << 20); L(@"  usar 64 MB dentro da janela: OK"); }
+              else L(@"  usar 64 MB dentro da janela: falhou (errno %d)", errno);
+              munmap(w, GB4);
+            } else {
+              L(@"  nenhuma reserva alinhada funcionou");
+            }
+            void *big = mmap(NULL, 2 * GB4, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (big == MAP_FAILED) L(@"  8 GB em qualquer lugar: falhou (errno %d)", errno);
+            else { L(@"  8 GB em qualquer lugar: 0x%llx", (uint64_t)big); munmap(big, 2 * GB4); }
+            L(@"");
+
+            L(@"3) Reiniciar sem ASLR (posix_spawn)");
+            init_t ai = (init_t)dlsym(RTLD_DEFAULT, "posix_spawnattr_init");
+            flags_t af = (flags_t)dlsym(RTLD_DEFAULT, "posix_spawnattr_setflags");
+            spawn_t sp = (spawn_t)dlsym(RTLD_DEFAULT, "posix_spawn");
+            if (!ai || !af || !sp) {
+              L(@"  funcoes nao encontradas");
+            } else {
+              void *attr = NULL; ai(&attr); af(&attr, 0x100);
+              NSString *exe = NSBundle.mainBundle.executablePath;
+              char *argv[] = { (char *)exe.fileSystemRepresentation, "--child", NULL };
+              char *envp[] = { NULL };
+              pid_t pid = 0;
+              int rc = sp(&pid, argv[0], NULL, &attr, argv, envp);
+              L(@"  resultado: %d (%s)", rc, rc ? strerror(rc) : "ok");
+            }
+            L(@"");
+
+            L(@"4) Memoria");
+            uint64_t mem = 0; size_t len = sizeof mem;
+            sysctlbyname("hw.memsize", &mem, &len, NULL, 0);
+            L(@"  pagina: %d bytes", (int)getpagesize());
+            L(@"  RAM: %llu MB", mem >> 20);
+            L(@"  disponivel ao app: %lu MB", (unsigned long)(os_proc_available_memory() >> 20));
+            return s;
+          }
+
+          @interface VC : UIViewController @end
+          @implementation VC
+          - (void)viewDidLoad {
+            [super viewDidLoad];
+            self.view.backgroundColor = UIColor.blackColor;
+            UITextView *t = [[UITextView alloc] initWithFrame:self.view.bounds];
+            t.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            t.backgroundColor = UIColor.blackColor;
+            t.textColor = UIColor.greenColor;
+            t.editable = NO;
+            t.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+            t.textContainerInset = UIEdgeInsetsMake(50, 8, 8, 8);
+            t.text = report();
+            [self.view addSubview:t];
+          }
+          @end
+
+          @interface AD : UIResponder <UIApplicationDelegate>
+          @property (strong) UIWindow *window;
+          @end
+          @implementation AD
+          - (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
+            self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+            self.window.rootViewController = [VC new];
+            [self.window makeKeyAndVisible];
+            return YES;
+          }
+          @end
+
+          int main(int argc, char *argv[]) {
+            if (argc > 1 && !strcmp(argv[1], "--child")) return 0;
+            @autoreleasepool { return UIApplicationMain(argc, argv, nil, @"AD"); }
+          }
+          EOF
+          cat > Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>__NAME__</string>
+          <key>CFBundleIdentifier</key><string>com.bt3test.__NAME__</string>
+          <key>CFBundleName</key><string>__NAME__</string>
+          <key>CFBundleDisplayName</key><string>__NAME__</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>CFBundleShortVersionString</key><string>1.0</string>
+          <key>MinimumOSVersion</key><string>14.0</string>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UILaunchScreen</key><dict/>
+          <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+          </dict></plist>
+          EOF
+
+      - name: Compilar e empacotar (A: ligacao normal, B: __TEXT em 0x1020000000)
+        run: |
+          cd t
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          build() {
+            name=$1; shift
+            mkdir -p "out/$name/Payload/$name.app"
+            xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -fobjc-arc -isysroot "$SDK" \
+              main.m -framework UIKit -framework Foundation -o "out/$name/Payload/$name.app/$name" "$@" || return 1
+            sed "s/__NAME__/$name/g" Info.plist > "out/$name/Payload/$name.app/Info.plist"
+            (cd "out/$name" && zip -qr "../$name.ipa" Payload)
+            echo "== $name"; file "out/$name/Payload/$name.app/$name"
+            otool -l "out/$name/Payload/$name.app/$name" | grep -A3 "segname __TEXT" | head -4
+          }
+          build AslrA
+          build AslrB -Wl,-segaddr,__TEXT,0x1020000000 || echo "::warning::AslrB nao ligou com -segaddr (veja o log acima)"
+          ls -la out/*.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipas
+          path: t/out/*.ipa
+          if-no-files-found: error
