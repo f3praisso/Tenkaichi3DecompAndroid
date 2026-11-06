@@ -1,0 +1,76 @@
+name: macos
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["port/**", "src/**", "include/**", ".github/workflows/macos.yml"]
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15   # Apple Silicon (arm64)
+    timeout-minutes: 90
+    env:
+      BT3_CC: mac64
+      BT3_SKELETON: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ferramentas (Homebrew)
+        run: |
+          mkdir -p logs
+          # LLVM do Homebrew: o clang da Apple não tem ponteiros de 4 bytes no arm64
+          brew install llvm sdl3 shaderc spirv-cross 2>&1 | tee logs/brew.txt
+          ls /opt/homebrew/opt/llvm/bin/{clang,llc,opt,llvm-config}
+          /opt/homebrew/opt/llvm/bin/clang --version
+          ls /opt/homebrew/opt/sdl3/lib/libSDL3.dylib
+          which glslc spirv-cross
+
+      - name: Ambiente Python (libclang para o ptr32.py)
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install --quiet --disable-pip-version-check "libclang==18.1.1"
+          .venv/bin/python -c "import clang.cindex as c; c.Index.create(); print('libclang ok')"
+
+      - name: Compilar o código do jogo (undefined.py)
+        run: |
+          set -o pipefail
+          .venv/bin/python port/tools/undefined.py 2>&1 | tee logs/undefined.txt
+          # o script imprime "FAILED <arquivo>" por arquivo que não compilou
+          if grep -q "^FAILED" logs/undefined.txt; then
+            echo "::error::arquivos que falharam: $(grep -c '^FAILED' logs/undefined.txt)"
+            grep "^FAILED" logs/undefined.txt | head -20
+            exit 1
+          fi
+
+      - name: Ligar (link.py)
+        run: |
+          set -o pipefail
+          .venv/bin/python port/tools/link.py 2>&1 | tee logs/link.txt
+          grep -q "link OK" logs/link.txt
+          ls -la port/build/bt3_mac*
+
+      - name: Verificar que o binário é arm64 Mach-O
+        run: |
+          file port/build/bt3_mac
+          lipo -info port/build/bt3_mac
+          otool -l port/build/bt3_mac | grep -A4 -E "LC_SEGMENT_64" | grep -E "segname|vmaddr" | head -20 | tee logs/segments.txt
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: bt3_mac
+          path: |
+            port/build/bt3_mac
+            port/build/bt3_mac.dat
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: logs/
