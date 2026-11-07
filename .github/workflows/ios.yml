@@ -114,6 +114,23 @@ jobs:
               ('def link(objs, extra):\n    if MAC:\n        return link_mac(objs, extra)', LINK_IOS),
           ])
 
+          # ---- marco 2: o app de iPhone (entrada pelo SDL, janela alinhada propria, espelho do programa)
+          edit("port/src/port_addr.h", [
+              ('#include <mach-o/ldsyms.h> /* _mh_execute_header: the program\'s first byte */\n#define PORT_WINDOW ((uintptr_t)&_mh_execute_header - 0x20000000u)',
+               '#include <TargetConditionals.h>\n#include <mach-o/ldsyms.h> /* _mh_execute_header: the program\'s first byte */\n#if TARGET_OS_IPHONE\nextern void *Port_Window; /* iOS: a window of its own, aligned (plat_ios.c) */\n#define PORT_WINDOW ((uintptr_t)Port_Window)\n#else\n#define PORT_WINDOW ((uintptr_t)&_mh_execute_header - 0x20000000u)\n#endif'),
+          ])
+          edit("port/src/plat_mem.c", [
+              ('#include <crt_externs.h>',
+               '#include <TargetConditionals.h>\n#if TARGET_OS_IPHONE\n#define PORT_MAP_FIXED MAP_FIXED /* iOS: the window is reserved by plat_ios.c; these regions replace parts of it */\n#else\n#define PORT_MAP_FIXED 0\n#endif\n#include <crt_externs.h>'),
+              ('void *p = mmap((void *)at, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);',
+               'void *p = mmap((void *)at, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | PORT_MAP_FIXED, -1, 0);'),
+              ('int __wrap_main(int argc, char **argv) {\n    sArgc = argc;\n    sArgv = argv;\n    sGameStackTop = (uint8_t *)Port_Ptr(STACK_BASE + STACK_SIZE);',
+               '#if TARGET_OS_IPHONE\nint Port_GameEntry(int argc, char **argv) { /* (the process\'s entry is __wrap_main in plat_ios.c) */\n#else\nint __wrap_main(int argc, char **argv) {\n#endif\n    sArgc = argc;\n    sArgv = argv;\n    sGameStackTop = (uint8_t *)Port_Ptr(STACK_BASE + STACK_SIZE);'),
+              ('__attribute__((constructor)) static void Port_MapMemory(void) {',
+               '#if TARGET_OS_IPHONE\nvoid Port_MapMemory(void) { /* iOS: called from the mirror (plat_ios.c), not at load */\n#else\n__attribute__((constructor)) static void Port_MapMemory(void) {\n#endif'),
+          ])
+
+
           # contorno: o libclang 18 nao honra __ptr32 no arm64, e o leitor de tela tem static_assert de layout com ponteiros
           a11y = ROOT / "port/src/a11y_game.c"
           if a11y.exists():
@@ -130,6 +147,300 @@ jobs:
           python3 patch_ios.py
           git diff --stat || true
           BT3_CC=ios64 python3 -c "import sys; sys.path.insert(0,'port/tools'); import toolchain as t; print(t.VARIANT, t.MAC, t.IOS, t.MAC_TRIPLE, t.EXE, t.CLANG_TARGET)"
+
+      - name: Escrever o plat_ios.c (entrada pelo SDL, janela alinhada, espelho do programa)
+        run: |
+          cat > port/src/plat_ios.c <<'CEOF'
+          /* iOS: the process's start, SDL's UIKit application, and the game's run from a mirror of the program in a window of
+             its own.
+
+             The game's addresses are offsets in a 4 GB window whose base has its low 32 bits zero (port_addr.h, macwin.cpp).
+             On macOS the program is linked at 1 TB and starts itself again with ASLR switched off, to be there. An iOS app can
+             do neither (posix_spawn is refused, and the process has one free stretch of address space of about 6 GB, which
+             starts on a 4 GB boundary). So the window is reserved here, aligned, and the program is MIRRORED into it at
+             W + 0x20000000: its code and data are mapped a second time at that address (vm_remap, the same pages, still signed),
+             and the game runs from the mirror, where every address the compiled code computes from its own position is a game
+             address. The pointers the program holds in its data (rebase entries) are moved to the mirror, as a loader does.
+
+             Everything is logged to Documents/bt3_log.txt (visible in the Files app): there is no console on the phone. */
+          #include <TargetConditionals.h>
+          #if TARGET_OS_IPHONE
+          #include <mach-o/dyld.h>
+          #include <mach-o/loader.h>
+          #include <mach/mach.h>
+          #include <mach/vm_map.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          #include <unistd.h>
+
+          #define say(...) fprintf(stderr, __VA_ARGS__)
+
+          /* SDL's own entry for an application (SDL_main.h): UIKit runs, and `main_fn` is called on the main thread once the
+             application has launched. Declared here: the port's files are compiled without SDL's include path. */
+          typedef int (*main_fn)(int argc, char **argv);
+          extern int SDL_RunApp(int argc, char **argv, main_fn mainFunction, void *reserved);
+
+          extern void *Port_Window;
+          extern void Port_MapMemory(void);
+          extern int Port_GameEntry(int argc, char **argv);
+
+          typedef struct {
+              uint64_t vm, size, fileoff;
+              char name[17];
+          } Seg;
+
+          static Seg sSeg[16];
+          static int sNSeg;
+          static uint64_t sObjc[32][2]; /* sections of Objective-C metadata: left as they are (the runtime registered them where they were) */
+          static int sNObjc;
+          static uint64_t sOrigLo, sAlias0;
+          static uint64_t sReloc, sSkipped;
+
+          static void fail(const char *what) {
+              say("bt3: %s\n", what);
+              exit(3);
+          }
+
+          /* ---- log: stderr and stdout go to Documents/bt3_log.txt (the run before kept as bt3_log_prev.txt) */
+          static void log_setup(void) {
+              const char *home = getenv("HOME");
+              char path[1024], prev[1024], data[1024];
+
+              if (home == NULL) {
+                  return;
+              }
+              snprintf(path, sizeof(path), "%s/Documents/bt3_log.txt", home);
+              snprintf(prev, sizeof(prev), "%s/Documents/bt3_log_prev.txt", home);
+              rename(path, prev);
+              if (freopen(path, "w", stderr) != NULL) {
+                  setvbuf(stderr, NULL, _IONBF, 0);
+                  dup2(fileno(stderr), STDOUT_FILENO);
+              }
+              snprintf(data, sizeof(data), "%s/Documents/gamedata", home);
+              setenv("BT3_DATA", data, 0);
+              snprintf(data, sizeof(data), "%s/Documents", home);
+              if (chdir(data) != 0) {
+                  say("bt3: cannot enter %s\n", data);
+              }
+          }
+
+          /* ---- the program's own load commands */
+          static const struct dyld_info_command *parse_image(const struct mach_header_64 *h, intptr_t slide) {
+              const struct dyld_info_command *di = NULL;
+              const uint8_t *p = (const uint8_t *)(h + 1);
+              uint32_t i, k;
+
+              sNSeg = 0;
+              sNObjc = 0;
+              for (i = 0; i < h->ncmds; i++) {
+                  const struct load_command *lc = (const struct load_command *)p;
+                  if (lc->cmd == LC_SEGMENT_64 && sNSeg < 16) {
+                      const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+                      const struct section_64 *sec = (const struct section_64 *)(sc + 1);
+                      Seg *s = &sSeg[sNSeg++];
+                      s->vm = sc->vmaddr + (uint64_t)slide;
+                      s->size = sc->vmsize;
+                      s->fileoff = sc->fileoff;
+                      memcpy(s->name, sc->segname, 16);
+                      s->name[16] = 0;
+                      for (k = 0; k < sc->nsects; k++, sec++) {
+                          if (strncmp(sec->sectname, "__objc", 6) == 0 && sNObjc < 32) {
+                              sObjc[sNObjc][0] = sec->addr + (uint64_t)slide;
+                              sObjc[sNObjc][1] = sec->addr + (uint64_t)slide + sec->size;
+                              sNObjc++;
+                          }
+                      }
+                  } else if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) {
+                      di = (const struct dyld_info_command *)lc;
+                  }
+                  p += lc->cmdsize;
+              }
+              return di;
+          }
+
+          /* ---- the window: 4 GB aligned, in the process's one free stretch */
+          static uint64_t reserve_window(void) {
+              static const uint64_t gb[] = {6, 5, 4};
+              unsigned i;
+
+              for (i = 0; i < sizeof(gb) / sizeof(gb[0]); i++) {
+                  vm_address_t base = 0;
+                  vm_size_t total = (vm_size_t)(gb[i] << 30);
+                  kern_return_t kr = vm_map(mach_task_self(), &base, total, 0, VM_FLAGS_ANYWHERE, MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE,
+                                            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_DEFAULT);
+                  uint64_t w;
+
+                  if (kr != KERN_SUCCESS) {
+                      say("bt3: reserving %llu GB failed (%d)\n", gb[i], (int)kr);
+                      continue;
+                  }
+                  w = ((uint64_t)base + 0xFFFFFFFFull) & ~0xFFFFFFFFull;
+                  say("bt3: reserved %llu GB at 0x%llx, window at 0x%llx, %llu MB after it\n", gb[i], (uint64_t)base, w, ((uint64_t)base + total - w) >> 20);
+                  if ((uint64_t)base + total - w >= 0x80000000ull) {
+                      return w;
+                  }
+                  vm_deallocate(mach_task_self(), base, total);
+              }
+              fail("no aligned window of 2 GB could be reserved");
+              return 0;
+          }
+
+          /* ---- the mirror: the program's segments (not the zero page, not the link edit data) mapped again at W + 0x20000000 */
+          static void mirror_segments(uint64_t w) {
+              int i;
+
+              sAlias0 = w + 0x20000000ull;
+              for (i = 0; i < sNSeg; i++) {
+                  vm_address_t dst;
+                  vm_prot_t cur = 0, mx = 0;
+                  kern_return_t kr;
+
+                  if (strcmp(sSeg[i].name, "__PAGEZERO") == 0 || strcmp(sSeg[i].name, "__LINKEDIT") == 0) {
+                      continue;
+                  }
+                  dst = (vm_address_t)(sAlias0 + (sSeg[i].vm - sOrigLo));
+                  kr = vm_remap(mach_task_self(), &dst, (vm_size_t)sSeg[i].size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                (vm_address_t)sSeg[i].vm, FALSE, &cur, &mx, VM_INHERIT_NONE);
+                  say("bt3: mirror of %s at 0x%llx: %s (kern %d, protection %d/%d)\n", sSeg[i].name, (uint64_t)dst, kr == KERN_SUCCESS ? "ok" : "FAILED", (int)kr,
+                      (int)cur, (int)mx);
+                  if (kr != KERN_SUCCESS) {
+                      fail("the program could not be mirrored");
+                  }
+              }
+          }
+
+          /* ---- the program's pointers in its data: moved to the mirror (the rebase opcodes dyld applied its slide with) */
+          static uint64_t uleb(const uint8_t **pp) {
+              uint64_t r = 0;
+              int shift = 0;
+              uint8_t b;
+
+              do {
+                  b = *(*pp)++;
+                  r |= (uint64_t)(b & 0x7F) << shift;
+                  shift += 7;
+              } while (b & 0x80);
+              return r;
+          }
+
+          static void rebase_at(uint64_t addr, uint64_t delta) {
+              int i;
+
+              for (i = 0; i < sNObjc; i++) {
+                  if (addr >= sObjc[i][0] && addr < sObjc[i][1]) {
+                      sSkipped++;
+                      return;
+                  }
+              }
+              *(uint64_t *)(uintptr_t)addr += delta;
+              sReloc++;
+          }
+
+          static void relocate(const struct dyld_info_command *di, uint64_t delta) {
+              uint64_t le = 0, leOff = 0, addr = 0, n, skip;
+              const uint8_t *p, *end;
+              int i, type = 1;
+
+              for (i = 0; i < sNSeg; i++) {
+                  if (strcmp(sSeg[i].name, "__LINKEDIT") == 0) {
+                      le = sSeg[i].vm;
+                      leOff = sSeg[i].fileoff;
+                  }
+              }
+              if (di == NULL || le == 0 || di->rebase_size == 0) {
+                  fail("the program has no rebase information (it must be linked without chained fixups)");
+              }
+              /* the data segments are writable for this, then the constant ones are closed again */
+              for (i = 0; i < sNSeg; i++) {
+                  if (strncmp(sSeg[i].name, "__DATA", 6) == 0 && mprotect((void *)(uintptr_t)sSeg[i].vm, (size_t)sSeg[i].size, PROT_READ | PROT_WRITE) != 0) {
+                      fail("cannot make the data segment writable");
+                  }
+              }
+              p = (const uint8_t *)(uintptr_t)(le + (di->rebase_off - leOff));
+              end = p + di->rebase_size;
+              while (p < end) {
+                  uint8_t op = *p++, imm = op & REBASE_IMMEDIATE_MASK;
+                  op &= REBASE_OPCODE_MASK;
+                  if (op == REBASE_OPCODE_DONE) {
+                      break;
+                  } else if (op == REBASE_OPCODE_SET_TYPE_IMM) {
+                      type = imm;
+                  } else if (op == REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB) {
+                      if (imm >= sNSeg) {
+                          fail("bad segment in the rebase information");
+                      }
+                      addr = sSeg[imm].vm + uleb(&p);
+                  } else if (op == REBASE_OPCODE_ADD_ADDR_ULEB) {
+                      addr += uleb(&p);
+                  } else if (op == REBASE_OPCODE_ADD_ADDR_IMM_SCALED) {
+                      addr += (uint64_t)imm * 8;
+                  } else if (op == REBASE_OPCODE_DO_REBASE_IMM_TIMES) {
+                      for (n = 0; n < imm; n++, addr += 8) {
+                          if (type == REBASE_TYPE_POINTER) rebase_at(addr, delta);
+                      }
+                  } else if (op == REBASE_OPCODE_DO_REBASE_ULEB_TIMES) {
+                      uint64_t count = uleb(&p);
+                      for (n = 0; n < count; n++, addr += 8) {
+                          if (type == REBASE_TYPE_POINTER) rebase_at(addr, delta);
+                      }
+                  } else if (op == REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB) {
+                      if (type == REBASE_TYPE_POINTER) rebase_at(addr, delta);
+                      addr += uleb(&p) + 8;
+                  } else if (op == REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB) {
+                      uint64_t count = uleb(&p);
+                      skip = uleb(&p);
+                      for (n = 0; n < count; n++, addr += skip + 8) {
+                          if (type == REBASE_TYPE_POINTER) rebase_at(addr, delta);
+                      }
+                  } else {
+                      fail("unknown rebase opcode");
+                  }
+              }
+              for (i = 0; i < sNSeg; i++) {
+                  if (strcmp(sSeg[i].name, "__DATA_CONST") == 0) {
+                      mprotect((void *)(uintptr_t)sSeg[i].vm, (size_t)sSeg[i].size, PROT_READ);
+                  }
+              }
+              say("bt3: %llu pointers moved to the mirror, %llu in Objective-C metadata left\n", sReloc, sSkipped);
+          }
+
+          /* What runs from the mirror: the memory of the game (what the constructor did on macOS), then the game. */
+          __attribute__((noinline)) static int game_via_mirror(int argc, char **argv) {
+              Port_MapMemory();
+              return Port_GameEntry(argc, argv);
+          }
+
+          static int app_main(int argc, char **argv) {
+              const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+              intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+              const struct dyld_info_command *di = parse_image(h, slide);
+              uint64_t w;
+              int (*fn)(int, char **);
+
+              sOrigLo = (uint64_t)(uintptr_t)h;
+              say("bt3: iOS start; the program is at 0x%llx (slide 0x%lx)\n", sOrigLo, (long)slide);
+              w = reserve_window();
+              mirror_segments(w);
+              relocate(di, sAlias0 - sOrigLo);
+              Port_Window = (void *)(uintptr_t)w;
+              fn = (int (*)(int, char **))(uintptr_t)(sAlias0 + ((uint64_t)(uintptr_t)game_via_mirror - sOrigLo));
+              say("bt3: entering the game through the mirror (window 0x%llx, game_via_mirror at %p)\n", w, (void *)fn);
+              return fn(argc, argv);
+          }
+
+          /* The process's entry (link.py: -e ___wrap_main): dyld calls it as main. SDL runs UIKit and calls app_main on the main
+             thread once the application has launched. */
+          int __wrap_main(int argc, char **argv) {
+              log_setup();
+              say("bt3: starting\n");
+              return SDL_RunApp(argc, argv, app_main, NULL);
+          }
+          #endif
+          CEOF
+          wc -l port/src/plat_ios.c
 
       - name: SDL3 para iOS (a partir do codigo-fonte)
         run: |
@@ -180,6 +491,55 @@ jobs:
           wc -l port/build/stubs.txt
           grep -c '^SDL_' port/build/stubs.txt || true
           cp port/build/stubs.txt logs/stubs.txt
+          if grep -qE 'SDL_RunApp|wrap_main|Port_GameEntry|Port_MapMemory' port/build/stubs.txt; then
+            echo "::error::um simbolo de entrada do iOS ficou como stub (faltou ligar):"
+            grep -E 'SDL_RunApp|wrap_main|Port_GameEntry|Port_MapMemory' port/build/stubs.txt
+            exit 1
+          fi
+          nm -g port/build/bt3_ios | grep -E "__wrap_main|SDL_RunApp|Port_GameEntry|Port_MapMemory" | tee logs/entry_symbols.txt
+
+      - name: Empacotar o app (BT3.ipa)
+        run: |
+          set -e
+          APP=ipa/Payload/BT3.app
+          mkdir -p "$APP"
+          cp port/build/bt3_ios "$APP/bt3_ios"
+          if [ -f port/build/bt3_ios.dat ]; then cp port/build/bt3_ios.dat "$APP/bt3_ios.dat"; else echo "::warning::bt3_ios.dat nao foi gerado"; fi
+          cat > "$APP/Info.plist" <<'PEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>bt3_ios</string>
+          <key>CFBundleIdentifier</key><string>com.bt3ios.dragonrage</string>
+          <key>CFBundleName</key><string>BT3</string>
+          <key>CFBundleDisplayName</key><string>BT3</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>CFBundleShortVersionString</key><string>0.1</string>
+          <key>MinimumOSVersion</key><string>14.0</string>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+          <key>UILaunchScreen</key><dict/>
+          <key>UIFileSharingEnabled</key><true/>
+          <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+          <key>UIRequiresFullScreen</key><true/>
+          <key>UIStatusBarHidden</key><true/>
+          <key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          <key>UISupportedInterfaceOrientations</key><array>
+            <string>UIInterfaceOrientationLandscapeLeft</string>
+            <string>UIInterfaceOrientationLandscapeRight</string>
+          </array>
+          </dict></plist>
+          PEOF
+          (cd ipa && zip -qr ../BT3.ipa Payload)
+          ls -la BT3.ipa "$APP"
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: BT3-ipa
+          path: BT3.ipa
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: success()
