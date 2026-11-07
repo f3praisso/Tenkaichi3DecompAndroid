@@ -74,6 +74,12 @@ jobs:
                'target = CLANG_TARGET if soft else (["-arch", "arm64", "-isysroot", CLANG_TARGET[-1], "-miphoneos-version-min=14.0"] if IOS else ["-arch", "arm64", "-mmacosx-version-min=11.0"]) + [f"-I{os.environ.get(\'BT3_SDL3\', \'/opt/homebrew/opt/sdl3\')}/include"]'),
               ('["spirv-cross", "--msl", "--msl-version", "20100", "--msl-decoration-binding",',
                '["spirv-cross", "--msl"] + (["--msl-ios"] if IOS else []) + ["--msl-version", "20100", "--msl-decoration-binding",'),
+              # miniaudio no iOS usa AVFoundation: o arquivo precisa ser compilado como Objective-C
+              ('return [cc] + target + [a for a in cmd[1:] if a not in MAC_DROP]',
+               'return [cc] + target + (["-x", "objective-c"] if IOS and any(str(a).endswith("snd_ma.c") for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
+              # diagnostico: o texto completo de cada erro de compilacao vai para port/build/failures.txt
+              ('print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200])',
+               'print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200]); open(ROOT / "port/build/failures.txt", "a").write("=== " + f.name + "\\n" + e[:5000] + "\\n")'),
           ])
 
           LINK_IOS = '''IOS_FRAMEWORKS = ["Foundation", "UIKit", "Metal", "QuartzCore", "CoreGraphics", "CoreMotion", "CoreHaptics", "AVFoundation",
@@ -169,6 +175,20 @@ jobs:
             port/build/bt3_ios.dat
             port/build/bt3_ios.map
           if-no-files-found: warn
+
+      - name: Diagnostico dos erros do undefined.py (so se falhou)
+        if: failure()
+        run: |
+          cp port/build/failures.txt logs/failures.txt 2>/dev/null || true
+          echo "--- linhas do .i onde o ptr32 parou"
+          for pair in plat_mem:347 file:590 btl_obj:1821 hud_b:659; do
+            n=${pair%%:*}; l=${pair##*:}
+            f=$(find port/build/obj_ios64 \( -name "${n}.i" -o -name "*_${n}.i" \) | head -1)
+            echo "== $n ($f) linha $l"
+            [ -n "$f" ] && sed -n "$((l-3)),$((l+3))p" "$f" | cut -c1-500
+          done | tee logs/ptr32_linhas.txt
+          echo "--- primeiros erros completos"
+          head -c 6000 port/build/failures.txt 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         if: always()
