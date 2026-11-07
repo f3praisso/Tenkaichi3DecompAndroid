@@ -1,1 +1,177 @@
+name: ios
 
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      BT3_CC: ios64
+      BT3_SKELETON: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ferramentas (Homebrew)
+        run: |
+          mkdir -p logs
+          brew install llvm spirv-cross shaderc cmake 2>&1 | tee logs/brew.txt
+          brew info --json=v2 sdl3 | python3 -c "import json,sys; print(json.load(sys.stdin)['formulae'][0]['versions']['stable'])" | tee logs/sdl_version.txt
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Ambiente Python (libclang para o ptr32.py)
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install --quiet --disable-pip-version-check "libclang==18.1.1"
+          .venv/bin/python -c "import clang.cindex as c; c.Index.create(); print('libclang ok')"
+
+      - name: Aplicar as mudancas (variante ios64 e contorno do leitor de tela)
+        run: |
+          cat > patch_ios.py <<'EOF'
+          import pathlib, sys
+
+          ROOT = pathlib.Path(".")
+          ok = True
+
+          def edit(path, pairs):
+              global ok
+              p = ROOT / path
+              t = p.read_text()
+              for old, new in pairs:
+                  if t.count(old) != 1:
+                      print(f"ANCORA NAO ENCONTRADA em {path} ({t.count(old)} vezes): {old[:90]!r}")
+                      ok = False
+                      continue
+                  t = t.replace(old, new)
+              p.write_text(t)
+
+          edit("port/tools/toolchain.py", [
+              ('MAC = VARIANT == "mac64"',
+               'IOS = VARIANT == "ios64"\nMAC = VARIANT in ("mac64", "ios64")'),
+              ('BITS64 = VARIANT in ("clang64", "win64", "mac64")',
+               'BITS64 = VARIANT in ("clang64", "win64", "mac64", "ios64")'),
+              ('MAC_TRIPLE = "arm64-apple-macos11"',
+               'MAC_TRIPLE = "arm64-apple-ios14.0" if IOS else "arm64-apple-macos11"'),
+              ('return subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()',
+               'return subprocess.run(["xcrun"] + (["--sdk", "iphoneos"] if IOS else []) + ["--show-sdk-path"], capture_output=True, text=True).stdout.strip()'),
+              ('"port/build/obj_data_mac64" if MAC else',
+               '"port/build/obj_data_ios64" if IOS else "port/build/obj_data_mac64" if MAC else'),
+              ('"mac64": "bt3_mac"}', '"mac64": "bt3_mac", "ios64": "bt3_ios"}'),
+          ])
+
+          edit("port/tools/undefined.py", [
+              ('from toolchain import VARIANT, WIN, MAC, BITS64, PREFIX, CLANG_TARGET, OBJ, DATA, sdl3, llvm',
+               'from toolchain import VARIANT, WIN, MAC, IOS, MAC_TRIPLE, BITS64, PREFIX, CLANG_TARGET, OBJ, DATA, sdl3, llvm'),
+              ('MAC_LLC = ["-mtriple=arm64-apple-macos11", ',
+               'MAC_LLC = [f"-mtriple={MAC_TRIPLE}", '),
+              ('target = CLANG_TARGET if soft else ["-arch", "arm64", "-mmacosx-version-min=11.0", f"-I{os.environ.get(\'BT3_SDL3\', \'/opt/homebrew/opt/sdl3\')}/include"]',
+               'target = CLANG_TARGET if soft else (["-arch", "arm64", "-isysroot", CLANG_TARGET[-1], "-miphoneos-version-min=14.0"] if IOS else ["-arch", "arm64", "-mmacosx-version-min=11.0"]) + [f"-I{os.environ.get(\'BT3_SDL3\', \'/opt/homebrew/opt/sdl3\')}/include"]'),
+              ('["spirv-cross", "--msl", "--msl-version", "20100", "--msl-decoration-binding",',
+               '["spirv-cross", "--msl"] + (["--msl-ios"] if IOS else []) + ["--msl-version", "20100", "--msl-decoration-binding",'),
+          ])
+
+          LINK_IOS = '''IOS_FRAMEWORKS = ["Foundation", "UIKit", "Metal", "QuartzCore", "CoreGraphics", "CoreMotion", "CoreHaptics", "AVFoundation",
+                            "AVFAudio", "AudioToolbox", "CoreAudio", "CoreFoundation", "GameController", "CoreBluetooth", "CoreMedia",
+                            "CoreVideo", "ImageIO", "UniformTypeIdentifiers", "OpenGLES"]
+
+          def link_ios(objs, extra):
+              """iOS arm64: one pass, SDL3 built for iOS (static), the frameworks it needs, no moved segments (the window is separate)."""
+              sdl = os.environ["BT3_SDL3"]
+              fw = [a for f in IOS_FRAMEWORKS for a in ("-framework", f)]
+              cmd = ["clang", "-arch", "arm64", "-isysroot", mac_sdk(), "-miphoneos-version-min=14.0", "-w", "-o", str(EXE)] + extra + objs + \\
+                    [f"-L{sdl}/lib", "-lSDL3", "-lc++"] + fw + ["-Wl,-e,___wrap_main", "-Wl,-export_dynamic", f"-Wl,-map,{EXE}.map"]
+              return subprocess.run(cmd, capture_output=True, text=True)
+
+          def link(objs, extra):
+              if IOS:
+                  return link_ios(objs, extra)
+              if MAC:
+                  return link_mac(objs, extra)'''
+          edit("port/tools/link.py", [
+              ('from toolchain import ROOT, VARIANT, WIN, MAC, PREFIX, OBJ, DATA, EXE, sdl3',
+               'from toolchain import ROOT, VARIANT, WIN, MAC, IOS, mac_sdk, PREFIX, OBJ, DATA, EXE, sdl3'),
+              ('def link(objs, extra):\n    if MAC:\n        return link_mac(objs, extra)', LINK_IOS),
+          ])
+
+          # contorno: o libclang 18 nao honra __ptr32 no arm64, e o leitor de tela tem static_assert de layout com ponteiros
+          a11y = ROOT / "port/src/a11y_game.c"
+          if a11y.exists():
+              t = a11y.read_text()
+              if "#include <stddef.h>" in t and "define _Static_assert" not in t:
+                  a11y.write_text(t.replace("#include <stddef.h>", "#include <stddef.h>\n#define _Static_assert(...)", 1))
+              else:
+                  print("aviso: a11y_game.c sem a ancora esperada (ou ja corrigido)")
+
+          if not ok:
+              sys.exit("Algumas ancoras nao foram encontradas: o projeto deste repositorio e diferente do que eu li. Mande esta saida.")
+          print("mudancas aplicadas")
+          EOF
+          python3 patch_ios.py
+          git diff --stat || true
+          BT3_CC=ios64 python3 -c "import sys; sys.path.insert(0,'port/tools'); import toolchain as t; print(t.VARIANT, t.MAC, t.IOS, t.MAC_TRIPLE, t.EXE, t.CLANG_TARGET)"
+
+      - name: SDL3 para iOS (a partir do codigo-fonte)
+        run: |
+          set -o pipefail
+          V=$(cat logs/sdl_version.txt)
+          echo "SDL3 $V"
+          git clone --depth 1 --branch "release-$V" https://github.com/libsdl-org/SDL.git sdl-src 2>&1 | tee logs/sdl_clone.txt \
+            || git clone --depth 1 https://github.com/libsdl-org/SDL.git sdl-src
+          cmake -S sdl-src -B sdl-build -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DCMAKE_BUILD_TYPE=Release -DSDL_STATIC=ON -DSDL_SHARED=OFF \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$PWD/sdl-ios" 2>&1 | tee logs/sdl_cmake.txt
+          cmake --build sdl-build -j 4 2>&1 | tail -n 40 | tee logs/sdl_build.txt
+          cmake --install sdl-build 2>&1 | tail -n 5
+          ls sdl-ios/lib sdl-ios/include | head -20
+          lipo -info sdl-ios/lib/libSDL3.a
+
+      - name: Compilar o codigo do jogo para iOS (undefined.py)
+        run: |
+          set -o pipefail
+          export BT3_SDL3="$PWD/sdl-ios"
+          .venv/bin/python port/tools/undefined.py 2>&1 | tee logs/undefined.txt
+          if grep -q "^FAILED" logs/undefined.txt; then
+            echo "::error::arquivos que falharam: $(grep -c '^FAILED' logs/undefined.txt)"
+            grep "^FAILED" logs/undefined.txt | cut -c1-220 | head -30
+            exit 1
+          fi
+
+      - name: Ligar para iOS (link.py)
+        run: |
+          set -o pipefail
+          export BT3_SDL3="$PWD/sdl-ios"
+          .venv/bin/python port/tools/link.py 2>&1 | tee logs/link.txt
+          grep -q "link OK" logs/link.txt
+          ls -la port/build/bt3_ios*
+
+      - name: Conferir que e Mach-O arm64 de iOS
+        run: |
+          file port/build/bt3_ios
+          lipo -info port/build/bt3_ios
+          otool -l port/build/bt3_ios | grep -A5 LC_BUILD_VERSION | tee logs/build_version.txt
+          echo "--- stubs (simbolos que nada fornece ainda)"
+          wc -l port/build/stubs.txt
+          grep -c '^SDL_' port/build/stubs.txt || true
+          cp port/build/stubs.txt logs/stubs.txt
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: bt3_ios
+          path: |
+            port/build/bt3_ios
+            port/build/bt3_ios.dat
+            port/build/bt3_ios.map
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: logs/
