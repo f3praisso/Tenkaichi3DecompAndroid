@@ -100,7 +100,7 @@ jobs:
               sdl = os.environ["BT3_SDL3"]
               fw = [a for f in IOS_FRAMEWORKS for a in ("-framework", f)]
               cmd = ["clang", "-arch", "arm64", "-isysroot", mac_sdk(), "-miphoneos-version-min=14.0", "-w", "-o", str(EXE)] + extra + objs + \\
-                    [f"-L{sdl}/lib", "-lSDL3", "-lc++"] + fw + ["-Wl,-e,___wrap_main", "-Wl,-export_dynamic", f"-Wl,-map,{EXE}.map"]
+                    [f"-L{sdl}/lib", "-lSDL3", "-lc++"] + fw + ["-Wl,-no_fixup_chains", "-Wl,-e,___wrap_main", "-Wl,-export_dynamic", f"-Wl,-map,{EXE}.map"]  # (formato antigo de relocacao: o ld recente quebra com as chained fixups)
               return subprocess.run(cmd, capture_output=True, text=True)
 
           def link(objs, extra):
