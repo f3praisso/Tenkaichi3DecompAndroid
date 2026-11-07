@@ -74,6 +74,15 @@ jobs:
                'target = CLANG_TARGET if soft else (["-arch", "arm64", "-isysroot", CLANG_TARGET[-1], "-miphoneos-version-min=14.0"] if IOS else ["-arch", "arm64", "-mmacosx-version-min=11.0"]) + [f"-I{os.environ.get(\'BT3_SDL3\', \'/opt/homebrew/opt/sdl3\')}/include"]'),
               ('["spirv-cross", "--msl", "--msl-version", "20100", "--msl-decoration-binding",',
                '["spirv-cross", "--msl"] + (["--msl-ios"] if IOS else []) + ["--msl-version", "20100", "--msl-decoration-binding",'),
+              # o eeconst reescreve 7.0 como float hexadecimal ate dentro de __attribute__((availability(...))) dos cabecalhos do iOS;
+              # o clang nao aceita isso como versao: volta para decimal
+              ('    i = pathlib.Path(str(o)[:-2] + ".i")\n    i.write_text(eeconst.transform(r.stdout))',
+               '    i = pathlib.Path(str(o)[:-2] + ".i")\n'
+               '    import re as _re\n'
+               '    def _ver(m):\n'
+               '        v = ("%.3f" % float.fromhex(m.group(2))).rstrip("0")\n'
+               '        return m.group(1) + "=" + (v + "0" if v.endswith(".") else v)\n'
+               '    i.write_text(_re.sub(r"(introduced|deprecated|obsoleted)=(0x[0-9a-fA-F.]+p[+-]?[0-9]+)", _ver, eeconst.transform(r.stdout)))'),
               # miniaudio no iOS usa AVFoundation: o arquivo precisa ser compilado como Objective-C
               ('return [cc] + target + [a for a in cmd[1:] if a not in MAC_DROP]',
                'return [cc] + target + (["-x", "objective-c"] if IOS and any(str(a).endswith("snd_ma.c") for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
@@ -136,6 +145,12 @@ jobs:
           cmake --install sdl-build 2>&1 | tail -n 5
           ls sdl-ios/lib sdl-ios/include | head -20
           lipo -info sdl-ios/lib/libSDL3.a
+
+      - name: Plugin do compilador (macwin.dylib), construido uma vez antes da compilacao em paralelo
+        run: |
+          set -o pipefail
+          .venv/bin/python -c "import sys; sys.path.insert(0, 'port/tools'); import macwin; print(macwin.plugin())" 2>&1 | tee logs/macwin_plugin.txt
+          ls -la port/build/macwin.dylib
 
       - name: Compilar o codigo do jogo para iOS (undefined.py)
         run: |
