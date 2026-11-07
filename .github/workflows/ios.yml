@@ -501,6 +501,8 @@ jobs:
       - name: Empacotar o app (BT3.ipa)
         run: |
           set -e
+          # O bundle id e o do app de teste AslrA de proposito: a conta gratuita so cria 10 App IDs a cada 7 dias,
+          # e reaproveitar um App ID ja registrado nao gasta um novo.
           APP=ipa/Payload/BT3.app
           mkdir -p "$APP"
           cp port/build/bt3_ios "$APP/bt3_ios"
@@ -510,7 +512,7 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
           <key>CFBundleExecutable</key><string>bt3_ios</string>
-          <key>CFBundleIdentifier</key><string>com.bt3ios.dragonrage</string>
+          <key>CFBundleIdentifier</key><string>com.bt3test.AslrA</string>
           <key>CFBundleName</key><string>BT3</string>
           <key>CFBundleDisplayName</key><string>BT3</string>
           <key>CFBundlePackageType</key><string>APPL</string>
