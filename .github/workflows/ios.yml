@@ -87,7 +87,7 @@ jobs:
                '    i.write_text(_re.sub(r"(introduced|deprecated|obsoleted)=(0x[0-9a-fA-F.]+p[+-]?[0-9]+)", _ver, eeconst.transform(r.stdout)))'),
               # miniaudio no iOS usa AVFoundation: o arquivo precisa ser compilado como Objective-C
               ('return [cc] + target + [a for a in cmd[1:] if a not in MAC_DROP]',
-               'return [cc] + target + (["-x", "objective-c"] if IOS and any(str(a).endswith("snd_ma.c") for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
+               'return [cc] + target + (["-x", "objective-c"] + (["-fobjc-arc"] if any(str(a).endswith("ios_touch.c") for a in cmd) else []) if IOS and any(str(a).endswith(("snd_ma.c", "ios_touch.c")) for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
               # diagnostico: o texto completo de cada erro de compilacao vai para port/build/failures.txt
               ('print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200])',
                'print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200]); open(ROOT / "port/build/failures.txt", "a").write("=== " + f.name + "\\n" + e[:5000] + "\\n")'),
@@ -193,6 +193,8 @@ jobs:
 
           /* port/src/gs/ios_setup.c: unpacks the user's disc image into <Documents>/gamedata, with a progress screen */
           extern int Ios_Setup(void);
+          /* port/src/gs/ios_touch.c: the on-screen controller (Objective-C), put on the game's window once there is one */
+          extern void Ios_TouchStart(void);
 
           extern void *Port_Window;
           extern void Port_MapMemory(void);
@@ -439,6 +441,7 @@ jobs:
 
           /* What runs from the mirror: the memory of the game (what the constructor did on macOS), then the game. */
           __attribute__((noinline)) static int game_via_mirror(int argc, char **argv) {
+              Ios_TouchStart();
               Port_MapMemory();
               return Port_GameEntry(argc, argv);
           }
@@ -489,6 +492,8 @@ jobs:
              program as the system loaded it. Nothing from the disc is kept anywhere but the app's own folder. */
           #include <SDL3/SDL.h>
           #include <dirent.h>
+          #include <libgen.h>
+          #include <mach-o/dyld.h>
           #include <errno.h>
           #include <stdint.h>
           #include <stdio.h>
@@ -891,6 +896,55 @@ jobs:
               return found;
           }
 
+          /* The engine's menu wording (port/translations in the source tree) comes inside the app; the engine reads it from
+             <gamedata>/game-text/translations. Copied when it is not there yet (a file already there is left alone). */
+          static void copy_tree(const char *src, const char *dst) {
+              DIR *d = opendir(src);
+              struct dirent *e;
+
+              if (d == NULL) {
+                  return;
+              }
+              mkdirs(dst);
+              while ((e = readdir(d)) != NULL) {
+                  char s[1100], t[1100];
+                  struct stat st;
+                  if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+                      continue;
+                  }
+                  snprintf(s, sizeof(s), "%s/%s", src, e->d_name);
+                  snprintf(t, sizeof(t), "%s/%s", dst, e->d_name);
+                  if (stat(s, &st) != 0) {
+                      continue;
+                  }
+                  if (S_ISDIR(st.st_mode)) {
+                      copy_tree(s, t);
+                  } else if (!exists(t)) {
+                      FILE *in = fopen(s, "rb"), *out = in ? fopen(t, "wb") : NULL;
+                      char buf[8192];
+                      size_t n;
+                      while (out != NULL && (n = fread(buf, 1, sizeof(buf), in)) > 0) {
+                          fwrite(buf, 1, n, out);
+                      }
+                      if (out) fclose(out);
+                      if (in) fclose(in);
+                  }
+              }
+              closedir(d);
+          }
+
+          static void ensure_translations(const char *gamedata) {
+              char exe[1024], src[1100], dst[1100];
+              uint32_t n = sizeof(exe);
+
+              if (_NSGetExecutablePath(exe, &n) != 0) {
+                  return;
+              }
+              snprintf(src, sizeof(src), "%s/translations", dirname(exe));
+              snprintf(dst, sizeof(dst), "%s/game-text/translations", gamedata);
+              copy_tree(src, dst);
+          }
+
           /* 1: the game's data are there (and the progress screen is closed); the caller goes on to the game. */
           int Ios_Setup(void) {
               const char *home = getenv("HOME");
@@ -907,6 +961,7 @@ jobs:
               snprintf(ready, sizeof(ready), "%s/.bt3_ready", gamedata);
               snprintf(slus, sizeof(slus), "%s/disc/SLUS_216.78", gamedata);
               if (exists(ready) && exists(slus)) {
+                  ensure_translations(gamedata);
                   return 1;
               }
               ui_open();
@@ -930,6 +985,7 @@ jobs:
                                   fputs("ok\n", f);
                                   fclose(f);
                               }
+                              ensure_translations(gamedata);
                               say("bt3: the game's data are ready (%s can be deleted now)\n", iso);
                               ui_close();
                               return 1;
@@ -950,6 +1006,194 @@ jobs:
           }
           SEOF
           wc -l port/src/gs/ios_setup.c
+
+      - name: Escrever o ios_touch.c (controle na tela, Objective-C)
+        run: |
+          cat > port/src/gs/ios_touch.c <<'TEOF'
+          /* iOS: the on-screen controller. (The engine takes it through Port_TouchPad, port/src/gs/gs_input.c: player 1's buttons
+             and sticks, added to the keyboard's and the controllers'. Android draws it in Kotlin: TouchPadView.)
+
+             Objective-C in a .c file: the build compiles this one as Objective-C with ARC (undefined.py). A transparent view over
+             the game's window with the PlayStation buttons; a touch outside a button goes on to the game's window (the settings
+             window, the mouse). START and SELECT together open the engine's settings window, as on Android. */
+          #import <UIKit/UIKit.h>
+
+          extern void Port_TouchPad(unsigned buttons, int lx, int ly, int rx, int ry);
+          extern int gPortOverlayOpen; /* gs_input.c: the engine's settings window is open */
+
+          enum {
+              B_SELECT = 0x0001, B_START = 0x0008, B_UP = 0x0010, B_RIGHT = 0x0020, B_DOWN = 0x0040, B_LEFT = 0x0080,
+              B_L2 = 0x0100, B_R2 = 0x0200, B_L1 = 0x0400, B_R1 = 0x0800,
+              B_TRIANGLE = 0x1000, B_CIRCLE = 0x2000, B_CROSS = 0x4000, B_SQUARE = 0x8000
+          };
+
+          #define N_CTRL 14
+
+          @interface BT3Pad : UIView
+          @end
+
+          @implementation BT3Pad {
+              unsigned _bit[N_CTRL];
+              CGRect _rect[N_CTRL];
+              CAShapeLayer *_shape[N_CTRL];
+              CATextLayer *_text[N_CTRL];
+              NSString *_label[N_CTRL];
+              unsigned _last;
+          }
+
+          - (instancetype)initWithFrame:(CGRect)frame {
+              static const unsigned bits[N_CTRL] = {B_UP, B_DOWN, B_LEFT, B_RIGHT, B_TRIANGLE, B_CROSS, B_SQUARE, B_CIRCLE,
+                                                    B_L1, B_L2, B_R1, B_R2, B_SELECT, B_START};
+              NSArray<NSString *> *labels = @[@"▲", @"▼", @"◀", @"▶", @"△", @"✕", @"□", @"○", @"L1", @"L2", @"R1", @"R2", @"SELECT", @"START"];
+              int i;
+
+              self = [super initWithFrame:frame];
+              if (self == nil) {
+                  return nil;
+              }
+              self.multipleTouchEnabled = YES;
+              self.backgroundColor = UIColor.clearColor;
+              self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              for (i = 0; i < N_CTRL; i++) {
+                  _bit[i] = bits[i];
+                  _label[i] = labels[i];
+                  _shape[i] = [CAShapeLayer layer];
+                  _shape[i].strokeColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+                  _shape[i].lineWidth = 2.0;
+                  _shape[i].fillColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
+                  [self.layer addSublayer:_shape[i]];
+                  _text[i] = [CATextLayer layer];
+                  _text[i].string = _label[i];
+                  _text[i].alignmentMode = kCAAlignmentCenter;
+                  _text[i].foregroundColor = [UIColor colorWithWhite:1.0 alpha:0.8].CGColor;
+                  _text[i].contentsScale = UIScreen.mainScreen.scale;
+                  [self.layer addSublayer:_text[i]];
+              }
+              return self;
+          }
+
+          - (void)layoutSubviews {
+              [super layoutSubviews];
+              CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+              CGFloat u = MIN(w, h) * 0.17, m = MIN(w, h) * 0.06;
+              CGFloat dx = m + u * 1.7, dy = h - m - u * 1.7;     /* the D-pad's centre */
+              CGFloat fx = w - m - u * 1.7, fy = h - m - u * 1.7; /* the face buttons' centre */
+              CGRect r[N_CTRL];
+              int i;
+
+              r[0] = CGRectMake(dx - u / 2, dy - u * 1.5, u, u);      /* up */
+              r[1] = CGRectMake(dx - u / 2, dy + u * 0.5, u, u);      /* down */
+              r[2] = CGRectMake(dx - u * 1.5, dy - u / 2, u, u);      /* left */
+              r[3] = CGRectMake(dx + u * 0.5, dy - u / 2, u, u);      /* right */
+              r[4] = CGRectMake(fx - u / 2, fy - u * 1.5, u, u);      /* triangle */
+              r[5] = CGRectMake(fx - u / 2, fy + u * 0.5, u, u);      /* cross */
+              r[6] = CGRectMake(fx - u * 1.5, fy - u / 2, u, u);      /* square */
+              r[7] = CGRectMake(fx + u * 0.5, fy - u / 2, u, u);      /* circle */
+              r[8] = CGRectMake(m, m, u * 1.5, u * 0.8);              /* L1 */
+              r[9] = CGRectMake(m, m + u * 0.95, u * 1.5, u * 0.8);   /* L2 */
+              r[10] = CGRectMake(w - m - u * 1.5, m, u * 1.5, u * 0.8);              /* R1 */
+              r[11] = CGRectMake(w - m - u * 1.5, m + u * 0.95, u * 1.5, u * 0.8);   /* R2 */
+              r[12] = CGRectMake(w / 2 - u * 1.9, h - m - u * 0.7, u * 1.7, u * 0.7); /* SELECT */
+              r[13] = CGRectMake(w / 2 + u * 0.2, h - m - u * 0.7, u * 1.7, u * 0.7); /* START */
+              [CATransaction begin];
+              [CATransaction setDisableActions:YES];
+              for (i = 0; i < N_CTRL; i++) {
+                  BOOL isRound = i < 8;
+                  _rect[i] = r[i];
+                  _shape[i].path = [UIBezierPath bezierPathWithRoundedRect:r[i] cornerRadius:isRound ? r[i].size.width / 2 : 10].CGPath;
+                  _text[i].fontSize = (i >= 12 ? u * 0.24 : (i >= 8 ? u * 0.3 : u * 0.42));
+                  _text[i].frame = CGRectMake(r[i].origin.x, r[i].origin.y + (r[i].size.height - _text[i].fontSize * 1.25) / 2, r[i].size.width, _text[i].fontSize * 1.3);
+              }
+              [CATransaction commit];
+          }
+
+          /* only a touch on a button is ours; the rest goes on to the game's window */
+          - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+              int i;
+              for (i = 0; i < N_CTRL; i++) {
+                  if (CGRectContainsPoint(CGRectInset(_rect[i], -6, -6), p)) {
+                      return self;
+                  }
+              }
+              return nil;
+          }
+
+          - (void)update:(UIEvent *)event {
+              unsigned bits = 0;
+              int i;
+
+              for (UITouch *t in event.allTouches) {
+                  if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) {
+                      continue;
+                  }
+                  CGPoint p = [t locationInView:self];
+                  for (i = 0; i < N_CTRL; i++) {
+                      if (CGRectContainsPoint(CGRectInset(_rect[i], -6, -6), p)) {
+                          bits |= _bit[i];
+                      }
+                  }
+              }
+              if (bits != _last) {
+                  [CATransaction begin];
+                  [CATransaction setDisableActions:YES];
+                  for (i = 0; i < N_CTRL; i++) {
+                      _shape[i].fillColor = [UIColor colorWithWhite:1.0 alpha:(bits & _bit[i]) ? 0.35 : 0.08].CGColor;
+                  }
+                  [CATransaction commit];
+                  _last = bits;
+              }
+              Port_TouchPad(bits, 0x80, 0x80, 0x80, 0x80);
+          }
+
+          - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self update:event]; }
+          - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self update:event]; }
+          - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self update:event]; }
+          - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self update:event]; }
+          @end
+
+          static BT3Pad *sPad;
+
+          static UIWindow *game_window(void) {
+              UIWindow *win = nil;
+              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                  if ([sc isKindOfClass:UIWindowScene.class]) {
+                      for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                          if (w.isKeyWindow || win == nil) {
+                              win = w;
+                          }
+                      }
+                  }
+              }
+              return win;
+          }
+
+          /* Called by plat_ios.c when the game starts: the game's window comes a little later, so a timer puts the controller on
+             it as soon as there is one, keeps it on top, and hides it while the engine's settings window is open. */
+          void Ios_TouchStart(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *timer) {
+                      UIWindow *win = game_window();
+                      if (win == nil) {
+                          return;
+                      }
+                      if (sPad == nil) {
+                          sPad = [[BT3Pad alloc] initWithFrame:win.bounds];
+                      }
+                      if (sPad.superview != win) {
+                          [win addSubview:sPad];
+                          sPad.frame = win.bounds;
+                      } else {
+                          [win bringSubviewToFront:sPad];
+                      }
+                      sPad.hidden = gPortOverlayOpen != 0;
+                      if (sPad.hidden) {
+                          Port_TouchPad(0, 0x80, 0x80, 0x80, 0x80);
+                      }
+                  }];
+              });
+          }
+          TEOF
+          wc -l port/src/gs/ios_touch.c
 
       - name: SDL3 para iOS (a partir do codigo-fonte)
         run: |
@@ -1017,6 +1261,7 @@ jobs:
           cp port/build/bt3_ios "$APP/bt3_ios"
           if [ -f port/build/bt3_ios.dat ]; then cp port/build/bt3_ios.dat "$APP/bt3_ios.dat"; else echo "::warning::bt3_ios.dat nao foi gerado"; fi
           if [ -f port/build/bt3_ios.mem ]; then cp port/build/bt3_ios.mem "$APP/bt3_ios.mem"; else echo "::warning::bt3_ios.mem nao foi gerado"; fi
+          cp -R port/translations "$APP/translations"
           cat > "$APP/Info.plist" <<'PEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
