@@ -131,6 +131,12 @@ jobs:
           ])
 
 
+          # o dispositivo SDL_GPU pedia shaders SPIR-V (Vulkan); no Apple o motor so tem MSL (SHADER_FORMAT): sem isso nao ha backend
+          edit("port/src/gs/gs_gpu.c", [
+              ('        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);',
+               '#ifdef __APPLE__\n        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);\n#else\n        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);\n#endif'),
+          ])
+
           # contorno: o libclang 18 nao honra __ptr32 no arm64, e o leitor de tela tem static_assert de layout com ponteiros
           a11y = ROOT / "port/src/a11y_game.c"
           if a11y.exists():
@@ -1008,6 +1014,7 @@ jobs:
           mkdir -p "$APP"
           cp port/build/bt3_ios "$APP/bt3_ios"
           if [ -f port/build/bt3_ios.dat ]; then cp port/build/bt3_ios.dat "$APP/bt3_ios.dat"; else echo "::warning::bt3_ios.dat nao foi gerado"; fi
+          if [ -f port/build/bt3_ios.mem ]; then cp port/build/bt3_ios.mem "$APP/bt3_ios.mem"; else echo "::warning::bt3_ios.mem nao foi gerado"; fi
           cat > "$APP/Info.plist" <<'PEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1026,6 +1033,7 @@ jobs:
           <key>UIFileSharingEnabled</key><true/>
           <key>LSSupportsOpeningDocumentsInPlace</key><true/>
           <key>UIRequiresFullScreen</key><true/>
+          <key>UIApplicationSupportsIndirectInputEvents</key><true/>
           <key>UIStatusBarHidden</key><true/>
           <key>UIViewControllerBasedStatusBarAppearance</key><false/>
           <key>UISupportedInterfaceOrientations</key><array>
