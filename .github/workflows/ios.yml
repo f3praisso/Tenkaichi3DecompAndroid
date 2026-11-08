@@ -11,6 +11,8 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 120
+    permissions:
+      contents: write   # para publicar o BT3.ipa em Releases (download direto, sem zip)
     env:
       BT3_CC: ios64
       BT3_SKELETON: "1"
@@ -1051,6 +1053,18 @@ jobs:
           name: BT3-ipa
           path: BT3.ipa
           if-no-files-found: error
+
+      - name: Publicar o BT3.ipa em Releases (download direto, sem zip)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete ios-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create ios-latest BT3.ipa --prerelease --target "${{ github.sha }}" \
+            --title "BT3 iOS (ultimo build)" \
+            --notes "Build de ${{ github.sha }}. Baixe o BT3.ipa e instale pelo SideStore (Compartilhar -> SideStore)."
+          echo "https://github.com/${{ github.repository }}/releases/tag/ios-latest"
 
       - uses: actions/upload-artifact@v4
         if: success()
