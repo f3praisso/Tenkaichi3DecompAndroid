@@ -1046,10 +1046,13 @@ jobs:
              A touch outside every control goes on to the game's window. START and SELECT together open the engine's settings. */
           #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
+          #import <Metal/Metal.h>
           #include <stdio.h>
 
           extern void Port_TouchPad(unsigned buttons, int lx, int ly, int rx, int ry);
           extern int gPortOverlayOpen; /* gs_input.c: the engine's settings window is open */
+          extern int Port_Setting(const char *name, int def);  /* plat_settings.c: bt3_settings.txt */
+          extern int Port_LateInput(void);                     /* plat_stub.c: "Low input lag" */
 
           enum {
               B_SELECT = 0x0001, B_L3 = 0x0002, B_START = 0x0008, B_UP = 0x0010, B_RIGHT = 0x0020, B_DOWN = 0x0040, B_LEFT = 0x0080,
@@ -1675,6 +1678,30 @@ jobs:
               return win;
           }
 
+          /* The game's picture reaches the screen through a CAMetalLayer that lets up to three pictures wait for the display's
+             refresh (its default): up to two refreshes of delay between a press and what it does, on top of the game's own.
+             Two is the layer's least. `ios_drawables` in bt3_settings.txt (2 or 3) puts it back if the game stutters. */
+          static void tune_metal(UIWindow *win) {
+              NSMutableArray<CALayer *> *todo = [NSMutableArray arrayWithObject:win.layer];
+              int want = Port_Setting("ios_drawables", 2);
+
+              want = want < 2 ? 2 : want > 3 ? 3 : want;
+              while (todo.count > 0) {
+                  CALayer *l = todo.lastObject;
+                  [todo removeLastObject];
+                  if ([l isKindOfClass:CAMetalLayer.class]) {
+                      CAMetalLayer *m = (CAMetalLayer *)l;
+                      if ((int)m.maximumDrawableCount != want) {
+                          fprintf(stderr, "bt3: Metal layer: %d pictures may wait for the display (was %d)\n", want, (int)m.maximumDrawableCount);
+                          m.maximumDrawableCount = (NSUInteger)want;
+                      }
+                  }
+                  if (l.sublayers != nil) {
+                      [todo addObjectsFromArray:l.sublayers];
+                  }
+              }
+          }
+
           /* Called by plat_ios.c when the game starts: the game's window comes a little later, so a timer puts the controller on
              it as soon as there is one, keeps it on top, and hides it while the engine's settings window is open. */
           void Ios_TouchStart(void) {
@@ -1687,7 +1714,9 @@ jobs:
                       }
                       if (sPad == nil) {
                           sPad = [[BT3Pad alloc] initWithFrame:win.bounds];
+                          fprintf(stderr, "bt3: low input lag: %s\n", Port_LateInput() ? "on" : "off");
                       }
+                      tune_metal(win);
                       if (sPad.superview != win) {
                           [win addSubview:sPad];
                           sPad.frame = win.bounds;
