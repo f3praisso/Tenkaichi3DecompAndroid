@@ -87,7 +87,7 @@ jobs:
                '    i.write_text(_re.sub(r"(introduced|deprecated|obsoleted)=(0x[0-9a-fA-F.]+p[+-]?[0-9]+)", _ver, eeconst.transform(r.stdout)))'),
               # miniaudio no iOS usa AVFoundation: o arquivo precisa ser compilado como Objective-C
               ('return [cc] + target + [a for a in cmd[1:] if a not in MAC_DROP]',
-               'return [cc] + target + (["-x", "objective-c"] + (["-fobjc-arc"] if any(str(a).endswith("ios_touch.c") for a in cmd) else []) if IOS and any(str(a).endswith(("snd_ma.c", "ios_touch.c")) for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
+               'return [cc] + target + (["-x", "objective-c"] + (["-fobjc-arc"] if any(str(a).endswith(("ios_touch.c", "ios_setup_ui.c")) for a in cmd) else []) if IOS and any(str(a).endswith(("snd_ma.c", "ios_touch.c", "ios_setup_ui.c")) for a in cmd) else []) + [a for a in cmd[1:] if a not in MAC_DROP]'),
               # diagnostico: o texto completo de cada erro de compilacao vai para port/build/failures.txt
               ('print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200])',
                'print("FAILED", f.name, next((l for l in e.splitlines() if "rror" in l or l.startswith("ptr32")), e.strip()[:150])[:200]); open(ROOT / "port/build/failures.txt", "a").write("=== " + f.name + "\\n" + e[:5000] + "\\n")'),
@@ -218,9 +218,11 @@ jobs:
               exit(3);
           }
 
-          /* A setting of the engine's file (bt3_settings.txt, `name=number` lines, in the current directory) put there only if
-             the file does not have it yet: the engine's own default stays what a player who changed it chose. */
-          static void seed_setting(const char *name, int value) {
+          /* The engine's settings file (bt3_settings.txt, `name=number` lines, in the current directory; for a name that comes
+             twice the last line counts). The iOS defaults are put there once: the first time the file has no `ios_defaults`
+             line they are added to the end (which wins over a value the engine saved before it knew them), and from then on the
+             player's own choices in the settings window are left alone. */
+          static int has_setting(const char *name) {
               char line[160];
               size_t n = strlen(name);
               int found = 0;
@@ -234,8 +236,17 @@ jobs:
               if (f != NULL) {
                   fclose(f);
               }
-              if (!found && (f = fopen("bt3_settings.txt", "a")) != NULL) {
-                  fprintf(f, "\n%s=%d\n", name, value);
+              return found;
+          }
+
+          static void seed_defaults(void) {
+              FILE *f;
+
+              if (has_setting("ios_defaults")) {
+                  return;
+              }
+              if ((f = fopen("bt3_settings.txt", "a")) != NULL) {
+                  fputs("\nlate_input=1\nios_defaults=1\n", f);
                   fclose(f);
               }
           }
@@ -264,7 +275,7 @@ jobs:
               /* "Low input lag" (F1 > Video in the engine's settings window): the wait for a picture is made just before the pads
                  are read, and one picture at most is on its way to the screen. Off in the engine; on here, where the buttons are
                  on glass: a press then waits a picture less to reach the game. Turned off in the settings window, it stays off. */
-              seed_setting("late_input", 1);
+              seed_defaults();
           }
 
           /* ---- the program's own load commands */
@@ -507,20 +518,19 @@ jobs:
       - name: Escrever o ios_setup.c (disco do jogo para gamedata, com tela de progresso)
         run: |
           cat > port/src/gs/ios_setup.c <<'SEOF'
-          /* iOS: the game's data from the user's own disc image.
+          /* iOS: the game's data from the user's own disc image (the part that has no screen: ios_setup_ui.c has it).
 
              The engine reads the unpacked disc from <Documents>/gamedata (what port/tools/extract_disc.py makes on a PC, and what
              the Android launcher makes): disc/SLUS_216.78, disc/BIN/..., the other files of DATA under disc/DATA/, and every AFS
              archive of DATA split into gamedata/<name>/00000.bin, 00001.bin... one file per entry.
 
-             There is no PC here: this reads the .iso (ISO 9660, 2048-byte sectors) the user copied into the app's folder in the
-             Files app, and writes that layout, with a progress screen. It runs before the game's code (plat_ios.c), in the
-             program as the system loaded it. Nothing from the disc is kept anywhere but the app's own folder. */
-          #include <SDL3/SDL.h>
+             There is no PC here: this reads the .iso (ISO 9660, 2048-byte sectors) the user pointed to and writes that layout.
+             It runs on a thread of its own, and tells its progress through an IosProgress the screen reads. Nothing from the disc
+             is kept anywhere but the app's own folder. */
           #include <dirent.h>
+          #include <errno.h>
           #include <libgen.h>
           #include <mach-o/dyld.h>
-          #include <errno.h>
           #include <stdint.h>
           #include <stdio.h>
           #include <stdlib.h>
@@ -529,6 +539,8 @@ jobs:
           #include <sys/mount.h>
           #include <sys/stat.h>
           #include <unistd.h>
+
+          #include "ios_setup.h"
 
           #define SECTOR 2048u
           #define say(...) fprintf(stderr, __VA_ARGS__)
@@ -546,93 +558,10 @@ jobs:
           } Task;
 
           static FILE *sIso;
-          static uint64_t sDone, sTotal;
-          static SDL_Window *sWin;
-          static SDL_Renderer *sRen;
-          static uint64_t sLastDraw;
-          static char sFail[512];
+          static IosProgress *sP;
 
-          /* ---------------------------------------------------------------------------------------------------- the screen */
-          static void ui_open(void) {
-              if (sRen != NULL) {
-                  return;
-              }
-              if (!SDL_Init(SDL_INIT_VIDEO)) {
-                  say("bt3: SDL_Init failed: %s\n", SDL_GetError());
-                  return;
-              }
-              sWin = SDL_CreateWindow("BT3", 800, 600, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIGH_PIXEL_DENSITY); /* (the size is ignored in full screen) */
-              if (sWin != NULL) {
-                  sRen = SDL_CreateRenderer(sWin, NULL);
-              }
-              if (sRen == NULL) {
-                  say("bt3: no window for the setup screen: %s\n", SDL_GetError());
-              }
-          }
-
-          static void ui_close(void) {
-              if (sRen != NULL) {
-                  SDL_DestroyRenderer(sRen);
-                  sRen = NULL;
-              }
-              if (sWin != NULL) {
-                  SDL_DestroyWindow(sWin);
-                  sWin = NULL;
-              }
-          }
-
-          /* Three lines of text and, when frac >= 0, a progress bar. (SDL's debug font: plain ASCII, 8 pixels a letter.) */
-          static void ui_draw(const char *l1, const char *l2, const char *l3, float frac) {
-              int w = 0, h = 0;
-              float sc, bw;
-              SDL_FRect bar;
-
-              if (sRen == NULL) {
-                  return;
-              }
-              SDL_GetCurrentRenderOutputSize(sRen, &w, &h);
-              sc = (float)w / 480.0f;
-              if (sc < 1.0f) {
-                  sc = 1.0f;
-              }
-              SDL_SetRenderScale(sRen, sc, sc);
-              SDL_SetRenderDrawColor(sRen, 12, 12, 28, 255);
-              SDL_RenderClear(sRen);
-              SDL_SetRenderDrawColor(sRen, 255, 160, 30, 255);
-              SDL_RenderDebugText(sRen, 12.0f, 16.0f, "BT3 - dados do jogo");
-              SDL_SetRenderDrawColor(sRen, 230, 230, 230, 255);
-              if (l1 != NULL) SDL_RenderDebugText(sRen, 12.0f, 44.0f, l1);
-              if (l2 != NULL) SDL_RenderDebugText(sRen, 12.0f, 60.0f, l2);
-              if (l3 != NULL) SDL_RenderDebugText(sRen, 12.0f, 76.0f, l3);
-              if (frac >= 0.0f) {
-                  bw = (float)w / sc - 24.0f;
-                  bar.x = 12.0f;
-                  bar.y = 104.0f;
-                  bar.w = bw;
-                  bar.h = 14.0f;
-                  SDL_SetRenderDrawColor(sRen, 70, 70, 90, 255);
-                  SDL_RenderFillRect(sRen, &bar);
-                  bar.w = bw * (frac > 1.0f ? 1.0f : frac);
-                  SDL_SetRenderDrawColor(sRen, 255, 160, 30, 255);
-                  SDL_RenderFillRect(sRen, &bar);
-              }
-              SDL_RenderPresent(sRen);
-              SDL_PumpEvents();
-          }
-
-          static void progress(const char *what) {
-              uint64_t now = SDL_GetTicks();
-              char a[96], b[96];
-
-              if (now - sLastDraw < 120) {
-                  SDL_PumpEvents();
-                  return;
-              }
-              sLastDraw = now;
-              snprintf(a, sizeof(a), "Lendo o disco e gravando os arquivos");
-              snprintf(b, sizeof(b), "%d%%   %llu de %llu MB   %s", sTotal ? (int)(sDone * 100 / sTotal) : 0, (unsigned long long)(sDone >> 20),
-                       (unsigned long long)(sTotal >> 20), what);
-              ui_draw(a, b, "Pode levar alguns minutos. Mantenha o app aberto.", sTotal ? (float)((double)sDone / (double)sTotal) : 0.0f);
+          static void progress(const char *label) {
+              snprintf(sP->what, sizeof(sP->what), "%s", label);
           }
 
           /* ---------------------------------------------------------------------------------------------------- files */
@@ -666,18 +595,18 @@ jobs:
               uint64_t done = 0;
 
               if (f == NULL) {
-                  snprintf(sFail, sizeof(sFail), "nao consegui criar %s (%s)", dst, strerror(errno));
+                  snprintf(sP->fail, sizeof(sP->fail), "Não consegui criar %s (%s).", dst, strerror(errno));
                   return 0;
               }
               while (done < size) {
                   size_t n = size - done < sizeof(buf) ? (size_t)(size - done) : sizeof(buf);
                   if (!read_at(off + done, buf, n) || fwrite(buf, 1, n, f) != n) {
-                      snprintf(sFail, sizeof(sFail), "erro ao ler o disco ou gravar %s (%s)", dst, strerror(errno));
+                      snprintf(sP->fail, sizeof(sP->fail), "Erro ao ler o disco ou gravar %s (%s). Falta espaço?", dst, strerror(errno));
                       fclose(f);
                       return 0;
                   }
                   done += n;
-                  sDone += n;
+                  sP->done += n;
                   progress(label);
               }
               return fclose(f) == 0;
@@ -784,7 +713,7 @@ jobs:
                   } else {
                       snprintf(t->path, sizeof(t->path), "%s/%s", dst, v[i].name);
                   }
-                  sTotal += v[i].size;
+                  sP->total += v[i].size;
               }
               free(v);
           }
@@ -796,18 +725,18 @@ jobs:
               uint64_t base = (uint64_t)t->lba * SECTOR;
 
               if (!read_at(base, head, 8) || memcmp(head, "AFS\0", 4) != 0) {
-                  snprintf(sFail, sizeof(sFail), "%s nao e um arquivo AFS", t->path);
+                  snprintf(sP->fail, sizeof(sP->fail), "%s não é um arquivo AFS válido.", t->path);
                   return 0;
               }
               count = rd32(head + 4);
               if (count == 0 || count > 200000) {
-                  snprintf(sFail, sizeof(sFail), "AFS com %u entradas (estranho)", count);
+                  snprintf(sP->fail, sizeof(sP->fail), "Um arquivo AFS do disco tem %u entradas (estranho).", count);
                   return 0;
               }
               table = malloc((size_t)count * 8);
               if (table == NULL || !read_at(base + 8, table, (size_t)count * 8)) {
                   free(table);
-                  snprintf(sFail, sizeof(sFail), "nao consegui ler a tabela de %s", t->path);
+                  snprintf(sP->fail, sizeof(sP->fail), "Não consegui ler a tabela de %s.", t->path);
                   return 0;
               }
               mkdirs(t->path);
@@ -815,7 +744,7 @@ jobs:
                   uint32_t eoff = rd32(table + i * 8), esize = rd32(table + i * 8 + 4);
                   char dst[640];
                   if ((uint64_t)eoff + esize > (uint64_t)t->size) {
-                      snprintf(sFail, sizeof(sFail), "entrada %u de %s fora do arquivo", i, t->path);
+                      snprintf(sP->fail, sizeof(sP->fail), "A entrada %u de %s está fora do arquivo.", i, t->path);
                       free(table);
                       return 0;
                   }
@@ -830,6 +759,39 @@ jobs:
           }
 
           /* ---------------------------------------------------------------------------------------------------- the whole job */
+          static int extract(const char *isoPath, const char *gamedata);
+
+          /* Runs to the end (on the caller's thread) and tells how it went in `p`. */
+          int IosData_Extract(const char *isoPath, const char *gamedata, IosProgress *p) {
+              int ok;
+
+              sP = p;
+              p->done = p->total = 0;
+              p->what[0] = 0;
+              p->fail[0] = 0;
+              p->ok = 0;
+              p->finished = 0;
+              ok = extract(isoPath, gamedata);
+              if (ok) {
+                  char ready[700];
+                  FILE *f;
+                  snprintf(ready, sizeof(ready), "%s/.bt3_ready", gamedata);
+                  if ((f = fopen(ready, "w")) != NULL) {
+                      fputs("ok\n", f);
+                      fclose(f);
+                  }
+                  say("bt3: the game's data are ready (%s can be deleted now)\n", isoPath);
+              } else {
+                  say("bt3: unpacking failed: %s\n", p->fail);
+              }
+              if (ok) {
+                  p->done = p->total;
+              }
+              p->ok = ok;
+              p->finished = 1;
+              return ok;
+          }
+
           static int extract(const char *isoPath, const char *gamedata) {
               uint8_t pvd[SECTOR];
               int n = 0, i;
@@ -840,18 +802,18 @@ jobs:
 
               sIso = fopen(isoPath, "rb");
               if (sIso == NULL) {
-                  snprintf(sFail, sizeof(sFail), "nao consegui abrir %s", isoPath);
+                  snprintf(sP->fail, sizeof(sP->fail), "Não consegui abrir %s.", isoPath);
                   return 0;
               }
               if (!read_at(16 * (uint64_t)SECTOR, pvd, SECTOR) || pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
-                  snprintf(sFail, sizeof(sFail), "nao e uma imagem ISO 9660 de 2048 bytes por setor");
+                  snprintf(sP->fail, sizeof(sP->fail), "Isso não é uma imagem ISO 9660 de 2048 bytes por setor.");
                   fclose(sIso);
                   return 0;
               }
               root = list_dir(rd32(pvd + 156 + 2), rd32(pvd + 156 + 10), &n);
               if (root == NULL || (slus = find(root, n, "SLUS_216.78")) == NULL || (bin = find(root, n, "BIN")) == NULL ||
                   (data = find(root, n, "DATA")) == NULL) {
-                  snprintf(sFail, sizeof(sFail), "este disco nao e o USA (SLUS-21678): faltam SLUS_216.78, BIN ou DATA");
+                  snprintf(sP->fail, sizeof(sP->fail), "Este disco não é o do jogo (USA, SLUS-21678): faltam SLUS_216.78, BIN ou DATA.");
                   free(root);
                   fclose(sIso);
                   return 0;
@@ -864,13 +826,13 @@ jobs:
               mkdirs(p);
 
               sNTasks = 0;
-              sDone = sTotal = 0;
+              sP->done = sP->total = 0;
               {   /* SLUS_216.78 */
                   Task *t = task_new();
                   t->lba = slus->lba;
                   t->size = slus->size;
                   snprintf(t->path, sizeof(t->path), "%s/SLUS_216.78", disc);
-                  sTotal += slus->size;
+                  sP->total += slus->size;
               }
               snprintf(p, sizeof(p), "%s/BIN", disc);
               plan_dir(bin, p, gamedata, 0);
@@ -878,13 +840,13 @@ jobs:
               plan_dir(data, p, gamedata, 1);
               free(root);
 
-              if (statfs(gamedata, &fs) == 0 && (uint64_t)fs.f_bavail * fs.f_bsize < sTotal + (200ull << 20)) {
-                  snprintf(sFail, sizeof(sFail), "falta espaco: preciso de %llu MB livres e tenho %llu MB", (unsigned long long)((sTotal >> 20) + 200),
+              if (statfs(gamedata, &fs) == 0 && (uint64_t)fs.f_bavail * fs.f_bsize < sP->total + (200ull << 20)) {
+                  snprintf(sP->fail, sizeof(sP->fail), "Falta espaço: preciso de %llu MB livres e há %llu MB.", (unsigned long long)((sP->total >> 20) + 200),
                            (unsigned long long)(((uint64_t)fs.f_bavail * fs.f_bsize) >> 20));
                   fclose(sIso);
                   return 0;
               }
-              say("bt3: unpacking %s: %d files, %llu MB\n", isoPath, sNTasks, (unsigned long long)(sTotal >> 20));
+              say("bt3: unpacking %s: %d files, %llu MB\n", isoPath, sNTasks, (unsigned long long)(sP->total >> 20));
               for (i = 0; i < sNTasks; i++) {
                   const Task *t = &sTasks[i];
                   int ok = t->afs ? split_afs(t) : copy_out((uint64_t)t->lba * SECTOR, t->size, t->path, strrchr(t->path, '/') + 1);
@@ -903,7 +865,7 @@ jobs:
           }
 
           /* The first .iso in the folder, whose size has stopped changing (the Files app may still be copying it). */
-          static int find_iso(const char *dir, char *out, size_t cap) {
+          int IosData_FindIso(const char *dir, char *out, size_t cap) {
               DIR *d = opendir(dir);
               struct dirent *e;
               int found = 0;
@@ -959,7 +921,7 @@ jobs:
               closedir(d);
           }
 
-          static void ensure_translations(const char *gamedata) {
+          void IosData_Translations(const char *gamedata) {
               char exe[1024], src[1100], dst[1100];
               uint32_t n = sizeof(exe);
 
@@ -971,67 +933,301 @@ jobs:
               copy_tree(src, dst);
           }
 
-          /* 1: the game's data are there (and the progress screen is closed); the caller goes on to the game. */
+          /* 1: the data are unpacked (the marker is written when the last file is) and the program of the game is there. */
+          int IosData_Ready(const char *gamedata) {
+              char ready[700], slus[700];
+
+              snprintf(ready, sizeof(ready), "%s/.bt3_ready", gamedata);
+              snprintf(slus, sizeof(slus), "%s/disc/SLUS_216.78", gamedata);
+              return exists(ready) && exists(slus);
+          }
+          SEOF
+          cat > port/src/gs/ios_setup.h <<'HEOF'
+          /* ios_setup.c (the disc to gamedata) and ios_setup_ui.c (its screen) */
+          #ifndef IOS_SETUP_H
+          #define IOS_SETUP_H
+          #include <stddef.h>
+          #include <stdint.h>
+
+          /* what the screen reads while the work goes on (written by the worker thread, read by the main thread) */
+          typedef struct {
+              volatile uint64_t done, total;
+              volatile int finished, ok;
+              char what[96];  /* the file being written */
+              char fail[512]; /* why it did not work (valid when finished && !ok) */
+          } IosProgress;
+
+          int IosData_Ready(const char *gamedata);
+          int IosData_FindIso(const char *dir, char *out, size_t cap);
+          int IosData_Extract(const char *isoPath, const char *gamedata, IosProgress *p);
+          void IosData_Translations(const char *gamedata);
+          #endif
+          HEOF
+          wc -l port/src/gs/ios_setup.c port/src/gs/ios_setup.h
+
+      - name: Escrever o ios_setup_ui.c (a tela da preparacao dos dados, em UIKit)
+        run: |
+          cat > port/src/gs/ios_setup_ui.c <<'UEOF'
+          /* iOS: the screen of the preparation of the game's data (the work itself is ios_setup.c).
+
+             Objective-C in a .c file: the build compiles this one as Objective-C with ARC (undefined.py). It runs before the game's
+             code, in the program as the system loaded it, on a window of its own that goes away when the data are ready.
+             The disc image is chosen with the Files app's picker (read where it is: no copy of 4 GB) or put by hand in the app's
+             folder in the Files app (the first .iso there, once its size has stopped changing, starts the work by itself). The
+             work runs on a thread of its own, and this screen shows its progress. */
+          #import <UIKit/UIKit.h>
+          #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/stat.h>
+
+          #include "ios_setup.h"
+
+          #define ORANGE [UIColor colorWithRed:1.0 green:0.63 blue:0.12 alpha:1.0]
+
+          @interface BT3Setup : UIViewController <UIDocumentPickerDelegate>
+          @property (nonatomic, copy) NSString *docs;
+          @property (nonatomic, copy) NSString *gamedata;
+          @property (nonatomic, readonly) BOOL finished;
+          - (void)tick;
+          @end
+
+          @implementation BT3Setup {
+              UILabel *_title, *_body, *_percent, *_status;
+              UIProgressView *_bar;
+              UIButton *_pick, *_retry;
+              IosProgress _prog;
+              BOOL _working, _finished, _failed;
+              NSURL *_scoped;
+              NSString *_failedPath, *_isoPath;
+              uint64_t _lastSize;
+              int _stable;
+              CFTimeInterval _lastPoll;
+          }
+
+          - (BOOL)finished {
+              return _finished;
+          }
+
+          - (UILabel *)label:(NSString *)text size:(CGFloat)size bold:(BOOL)bold color:(UIColor *)color {
+              UILabel *l = [[UILabel alloc] init];
+              l.text = text;
+              l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+              l.textColor = color;
+              l.textAlignment = NSTextAlignmentCenter;
+              l.numberOfLines = 0;
+              return l;
+          }
+
+          - (UIButton *)button:(NSString *)title action:(SEL)action {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+              [b setTitle:title forState:UIControlStateNormal];
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+              [b setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
+              b.backgroundColor = ORANGE;
+              b.layer.cornerRadius = 12;
+              [b.heightAnchor constraintEqualToConstant:46].active = YES;
+              [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          - (void)viewDidLoad {
+              UIStackView *st;
+
+              [super viewDidLoad];
+              self.view.backgroundColor = [UIColor colorWithRed:0.05 green:0.06 blue:0.14 alpha:1.0];
+              _title = [self label:@"Preparar os dados do jogo" size:25 bold:YES color:ORANGE];
+              _body = [self label:@"" size:15 bold:NO color:[UIColor colorWithWhite:0.92 alpha:1.0]];
+              _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+              _bar.progressTintColor = ORANGE;
+              _bar.trackTintColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+              _percent = [self label:@"" size:17 bold:YES color:UIColor.whiteColor];
+              _status = [self label:@"" size:12 bold:NO color:[UIColor colorWithWhite:0.7 alpha:1.0]];
+              _pick = [self button:@"Escolher o arquivo .iso…" action:@selector(pickTapped)];
+              _retry = [self button:@"Procurar de novo" action:@selector(retryTapped)];
+              st = [[UIStackView alloc] initWithArrangedSubviews:@[_title, _body, _bar, _percent, _status, _pick, _retry]];
+              st.axis = UILayoutConstraintAxisVertical;
+              st.spacing = 12;
+              st.alignment = UIStackViewAlignmentFill;
+              st.translatesAutoresizingMaskIntoConstraints = NO;
+              [self.view addSubview:st];
+              [NSLayoutConstraint activateConstraints:@[
+                  [st.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+                  [st.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+                  [st.widthAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.widthAnchor multiplier:0.72],
+              ]];
+              [self showWaiting];
+          }
+
+          /* ---- the states of the screen */
+          - (void)showWaiting {
+              _title.text = @"Preparar os dados do jogo";
+              _body.text = @"O jogo precisa do arquivo .iso do seu disco (Dragon Ball Z Budokai Tenkaichi 3, versão USA). Toque no botão para escolher o arquivo. "
+                            @"Ou copie o .iso para a pasta BT3, no app Arquivos: aqui ele começa sozinho.";
+              _body.textColor = [UIColor colorWithWhite:0.92 alpha:1.0];
+              _bar.hidden = _percent.hidden = _status.hidden = _retry.hidden = YES;
+              _pick.hidden = NO;
+          }
+
+          - (void)showWorking {
+              _title.text = @"Preparando…";
+              _body.text = @"Lendo o disco e gravando os arquivos do jogo. Isso leva alguns minutos e só acontece uma vez. Mantenha o app aberto.";
+              _body.textColor = [UIColor colorWithWhite:0.92 alpha:1.0];
+              _bar.progress = 0;
+              _percent.text = @"0%";
+              _status.text = @"";
+              _bar.hidden = _percent.hidden = _status.hidden = NO;
+              _pick.hidden = _retry.hidden = YES;
+          }
+
+          - (void)showFailure:(NSString *)why {
+              _title.text = @"Não deu certo";
+              _body.text = why;
+              _body.textColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.5 alpha:1.0];
+              _bar.hidden = _percent.hidden = _status.hidden = YES;
+              _pick.hidden = _retry.hidden = NO;
+          }
+
+          /* ---- the work */
+          - (void)startWithPath:(NSString *)path scoped:(NSURL *)url {
+              NSString *iso = [path copy], *gd = [self.gamedata copy];
+              IosProgress *p = &_prog;
+
+              _working = YES;
+              _failed = NO;
+              _isoPath = iso;
+              _scoped = url;
+              UIApplication.sharedApplication.idleTimerDisabled = YES;
+              [self showWorking];
+              dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                  IosData_Extract(iso.fileSystemRepresentation, gd.fileSystemRepresentation, p);
+              });
+          }
+
+          - (void)pickTapped {
+              UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:NO];
+              pk.delegate = self;
+              pk.allowsMultipleSelection = NO;
+              [self presentViewController:pk animated:YES completion:nil];
+          }
+
+          - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+              NSURL *u = urls.firstObject;
+              if (u != nil && !_working) {
+                  BOOL access = [u startAccessingSecurityScopedResource];
+                  [self startWithPath:u.path scoped:access ? u : nil];
+              }
+          }
+
+          - (void)retryTapped {
+              _failedPath = nil;
+              _failed = NO;
+              _stable = 0;
+              _lastSize = 0;
+              [self showWaiting];
+          }
+
+          /* called about twenty times a second by the loop that serves the window */
+          - (void)tick {
+              if (_working) {
+                  uint64_t d = _prog.done, t = _prog.total;
+                  char what[96];
+
+                  memcpy(what, _prog.what, sizeof(what));
+                  what[sizeof(what) - 1] = 0;
+                  if (t > 0) {
+                      _bar.progress = (float)((double)d / (double)t);
+                      _percent.text = [NSString stringWithFormat:@"%d%%  ·  %llu de %llu MB", (int)(d * 100 / t), (unsigned long long)(d >> 20), (unsigned long long)(t >> 20)];
+                  }
+                  _status.text = [NSString stringWithUTF8String:what] ?: @"";
+                  if (_prog.finished) {
+                      _working = NO;
+                      UIApplication.sharedApplication.idleTimerDisabled = NO;
+                      if (_scoped != nil) {
+                          [_scoped stopAccessingSecurityScopedResource];
+                          _scoped = nil;
+                      }
+                      if (_prog.ok) {
+                          IosData_Translations(self.gamedata.fileSystemRepresentation);
+                          _finished = YES;
+                      } else {
+                          _failed = YES;
+                          _failedPath = _isoPath;
+                          [self showFailure:[NSString stringWithUTF8String:_prog.fail] ?: @"Erro desconhecido."];
+                      }
+                  }
+                  return;
+              }
+              if (_failed || self.presentedViewController != nil || CACurrentMediaTime() - _lastPoll < 1.0) {
+                  return;
+              }
+              _lastPoll = CACurrentMediaTime();
+              {   /* an .iso put in the app's folder: started once its size has stopped changing (the Files app may still be copying) */
+                  char path[1024];
+                  struct stat st;
+                  if (IosData_FindIso(self.docs.fileSystemRepresentation, path, sizeof(path)) && stat(path, &st) == 0 && ![_failedPath isEqualToString:@(path)]) {
+                      if ((uint64_t)st.st_size == _lastSize) {
+                          _stable++;
+                      } else {
+                          _stable = 0;
+                          _lastSize = (uint64_t)st.st_size;
+                      }
+                      _body.text = [NSString stringWithFormat:@"Disco encontrado: %s (%llu MB).\n%@", strrchr(path, '/') + 1, (unsigned long long)(_lastSize >> 20),
+                                                              _stable >= 2 ? @"Começando…" : @"Esperando a cópia terminar…"];
+                      if (_stable >= 2) {
+                          [self startWithPath:@(path) scoped:nil];
+                      }
+                  } else {
+                      _stable = 0;
+                      _lastSize = 0;
+                  }
+              }
+          }
+          @end
+
+          static UIWindowScene *first_scene(void) {
+              for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                  if ([sc isKindOfClass:UIWindowScene.class]) {
+                      return (UIWindowScene *)sc;
+                  }
+              }
+              return nil;
+          }
+
+          /* 1 when the data are there (the screen has come and gone if they were not); 0 if there is nowhere to put them. */
           int Ios_Setup(void) {
               const char *home = getenv("HOME");
-              char docs[512], gamedata[600], ready[700], slus[700], iso[700];
-              uint64_t lastSize = (uint64_t)-1;
-              int stable = 0;
-              struct stat st;
+              char docs[512], gamedata[600];
 
               if (home == NULL) {
                   return 0;
               }
               snprintf(docs, sizeof(docs), "%s/Documents", home);
               snprintf(gamedata, sizeof(gamedata), "%s/gamedata", docs);
-              snprintf(ready, sizeof(ready), "%s/.bt3_ready", gamedata);
-              snprintf(slus, sizeof(slus), "%s/disc/SLUS_216.78", gamedata);
-              if (exists(ready) && exists(slus)) {
-                  ensure_translations(gamedata);
+              if (IosData_Ready(gamedata)) {
+                  IosData_Translations(gamedata);
                   return 1;
               }
-              ui_open();
-              for (;;) {
-                  if (find_iso(docs, iso, sizeof(iso)) && stat(iso, &st) == 0) {
-                      char l2[200];
-                      if ((uint64_t)st.st_size == lastSize) {
-                          stable++;
-                      } else {
-                          stable = 0;
-                          lastSize = (uint64_t)st.st_size;
-                      }
-                      snprintf(l2, sizeof(l2), "%s: %llu MB", strrchr(iso, '/') + 1, (unsigned long long)(lastSize >> 20));
-                      ui_draw("Disco encontrado.", l2, stable >= 2 ? "Comecando..." : "Esperando a copia terminar...", -1.0f);
-                      if (stable >= 2) {
-                          mkdirs(gamedata);
-                          sFail[0] = 0;
-                          if (extract(iso, gamedata)) {
-                              FILE *f = fopen(ready, "w");
-                              if (f != NULL) {
-                                  fputs("ok\n", f);
-                                  fclose(f);
-                              }
-                              ensure_translations(gamedata);
-                              say("bt3: the game's data are ready (%s can be deleted now)\n", iso);
-                              ui_close();
-                              return 1;
-                          }
-                          say("bt3: unpacking failed: %s\n", sFail);
-                          for (;;) { /* the user's move: fix the file and open the app again */
-                              ui_draw("Nao deu certo:", sFail, "Corrija o arquivo .iso e abra o app de novo.", -1.0f);
-                              SDL_Delay(500);
-                          }
-                      }
-                  } else {
-                      lastSize = (uint64_t)-1;
-                      stable = 0;
-                      ui_draw("Nao encontrei nenhum arquivo .iso.", "Copie o .iso do jogo (USA, SLUS-21678) para a pasta BT3", "no app Arquivos. Ele comeca sozinho quando terminar.", -1.0f);
+              @autoreleasepool {
+                  BT3Setup *vc = [[BT3Setup alloc] init];
+                  UIWindowScene *scene = first_scene();
+                  UIWindow *win = scene != nil ? [[UIWindow alloc] initWithWindowScene:scene] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+
+                  vc.docs = @(docs);
+                  vc.gamedata = @(gamedata);
+                  win.rootViewController = vc;
+                  [win makeKeyAndVisible];
+                  while (!vc.finished) {
+                      [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+                      [vc tick];
                   }
-                  SDL_Delay(1000);
+                  win.hidden = YES;
+                  win.rootViewController = nil;
               }
+              return 1;
           }
-          SEOF
-          wc -l port/src/gs/ios_setup.c
+          UEOF
+          wc -l port/src/gs/ios_setup_ui.c
 
       - name: Escrever o ios_touch.c (controle na tela, Objective-C)
         run: |
@@ -1801,6 +1997,71 @@ jobs:
           if [ -f port/build/bt3_ios.dat ]; then cp port/build/bt3_ios.dat "$APP/bt3_ios.dat"; else echo "::warning::bt3_ios.dat nao foi gerado"; fi
           if [ -f port/build/bt3_ios.mem ]; then cp port/build/bt3_ios.mem "$APP/bt3_ios.mem"; else echo "::warning::bt3_ios.mem nao foi gerado"; fi
           cp -R port/translations "$APP/translations"
+          # o icone: gerado aqui (nada de arte do jogo), em 120 e 180 pixels
+          mkdir -p icon
+          cat > make_icon.py <<'IEOF'
+          """O icone do app: gerado aqui, sem imagem de ninguem. Fundo azul-violeta, um brilho laranja e as letras BT3."""
+          import os, sys
+          from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+          S = 1024
+          out = sys.argv[1] if len(sys.argv) > 1 else "."
+
+          # fundo: degrade vertical
+          bg = Image.new("RGB", (S, S))
+          d = ImageDraw.Draw(bg)
+          for y in range(S):
+              t = y / (S - 1)
+              d.line([(0, y), (S, y)], fill=(int(14 + 52 * t), int(18 - 4 * t), int(56 + 54 * t)))
+
+          # brilho laranja atras das letras
+          rg = Image.radial_gradient("L").resize((S, S)).point(lambda v: 255 - v)
+          mask = rg.point(lambda v: int((v / 255.0) ** 2.0 * 235))
+          bg.paste(Image.new("RGB", (S, S), (255, 138, 20)), (0, 0), mask)
+
+          # faixas de luz (raios) sutis
+          rays = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          rd = ImageDraw.Draw(rays)
+          import math
+          for k in range(12):
+              a = math.radians(k * 30 + 8)
+              x1, y1 = S / 2 + math.cos(a) * S, S / 2 + math.sin(a) * S
+              a2 = a + math.radians(5)
+              x2, y2 = S / 2 + math.cos(a2) * S, S / 2 + math.sin(a2) * S
+              rd.polygon([(S / 2, S / 2), (x1, y1), (x2, y2)], fill=(255, 190, 80, 28))
+          bg = Image.alpha_composite(bg.convert("RGBA"), rays).convert("RGB")
+
+          # letras
+          cands = [os.environ.get("BT3_ICON_FONT", ""), "/System/Library/Fonts/Supplemental/Impact.ttf", "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+                   "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/System/Library/Fonts/Helvetica.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+          font = None
+          for c in cands:
+              if c and os.path.exists(c):
+                  font = ImageFont.truetype(c, 430)
+                  break
+          if font is None:
+              font = ImageFont.load_default()
+          txt = "BT3"
+          d = ImageDraw.Draw(bg)
+          bb = d.textbbox((0, 0), txt, font=font, stroke_width=18)
+          w, h = bb[2] - bb[0], bb[3] - bb[1]
+          x, y = (S - w) // 2 - bb[0], (S - h) // 2 - bb[1] - 10
+          sh = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+          ImageDraw.Draw(sh).text((x + 10, y + 18), txt, font=font, fill=(0, 0, 0, 170), stroke_width=18, stroke_fill=(0, 0, 0, 170))
+          sh = sh.filter(ImageFilter.GaussianBlur(14))
+          bg = Image.alpha_composite(bg.convert("RGBA"), sh).convert("RGB")
+          d = ImageDraw.Draw(bg)
+          d.text((x, y), txt, font=font, fill=(255, 255, 255), stroke_width=18, stroke_fill=(255, 105, 0))
+
+          # o iOS pede icones opacos e quadrados (ele mesmo arredonda os cantos)
+          bg.save(os.path.join(out, "AppIcon1024.png"))
+          for size, name in ((120, "AppIcon60x60@2x.png"), (180, "AppIcon60x60@3x.png")):
+              bg.resize((size, size), Image.LANCZOS).save(os.path.join(out, name))
+          print("icones gerados em", out)
+          IEOF
+          .venv/bin/pip install --quiet --disable-pip-version-check pillow
+          .venv/bin/python make_icon.py icon
+          cp icon/AppIcon60x60@2x.png icon/AppIcon60x60@3x.png "$APP/"
           cat > "$APP/Info.plist" <<'PEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1816,6 +2077,7 @@ jobs:
           <key>UIDeviceFamily</key><array><integer>1</integer></array>
           <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
           <key>UILaunchScreen</key><dict/>
+          <key>CFBundleIcons</key><dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
           <key>UIFileSharingEnabled</key><true/>
           <key>LSSupportsOpeningDocumentsInPlace</key><true/>
           <key>UIRequiresFullScreen</key><true/>
