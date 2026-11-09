@@ -2,6 +2,12 @@ name: ios
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Maquina do build (macos-15, ou macos-14 se a macos-15 estiver lotada)"
+        default: "macos-15"
+        type: choice
+        options: [macos-15, macos-14]
 
 concurrency:
   group: ios-${{ github.ref }}
@@ -9,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     permissions:
       contents: write   # para publicar o BT3.ipa em Releases (download direto, sem zip)
