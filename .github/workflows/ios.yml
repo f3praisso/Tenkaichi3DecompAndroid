@@ -218,6 +218,28 @@ jobs:
               exit(3);
           }
 
+          /* A setting of the engine's file (bt3_settings.txt, `name=number` lines, in the current directory) put there only if
+             the file does not have it yet: the engine's own default stays what a player who changed it chose. */
+          static void seed_setting(const char *name, int value) {
+              char line[160];
+              size_t n = strlen(name);
+              int found = 0;
+              FILE *f = fopen("bt3_settings.txt", "r");
+
+              while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+                  if (strncmp(line, name, n) == 0 && line[n] == '=') {
+                      found = 1;
+                  }
+              }
+              if (f != NULL) {
+                  fclose(f);
+              }
+              if (!found && (f = fopen("bt3_settings.txt", "a")) != NULL) {
+                  fprintf(f, "\n%s=%d\n", name, value);
+                  fclose(f);
+              }
+          }
+
           /* ---- log: stderr and stdout go to Documents/bt3_log.txt (the run before kept as bt3_log_prev.txt) */
           static void log_setup(void) {
               const char *home = getenv("HOME");
@@ -239,6 +261,10 @@ jobs:
               if (chdir(data) != 0) {
                   say("bt3: cannot enter %s\n", data);
               }
+              /* "Low input lag" (F1 > Video in the engine's settings window): the wait for a picture is made just before the pads
+                 are read, and one picture at most is on its way to the screen. Off in the engine; on here, where the buttons are
+                 on glass: a press then waits a picture less to reach the game. Turned off in the settings window, it stays off. */
+              seed_setting("late_input", 1);
           }
 
           /* ---- the program's own load commands */
@@ -1020,6 +1046,7 @@ jobs:
              A touch outside every control goes on to the game's window. START and SELECT together open the engine's settings. */
           #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
+          #include <stdio.h>
 
           extern void Port_TouchPad(unsigned buttons, int lx, int ly, int rx, int ry);
           extern int gPortOverlayOpen; /* gs_input.c: the engine's settings window is open */
@@ -1075,6 +1102,8 @@ jobs:
               CATextLayer *_gearText, *_eyeText, *_doneText, *_banner;
               /* state */
               BOOL _down[N_KEYS];
+              BOOL _shown[N_KEYS]; /* what the layers show of _down */
+              BOOL _stickShown;
               __weak UITouch *_stickTouch;
               __weak UITouch *_dragTouch;
               __weak UITouch *_gearTouch;
@@ -1265,6 +1294,7 @@ jobs:
                   _text[k].opacity = _alpha;
                   _shape[k].path = [UIBezierPath bezierPathWithRoundedRect:r cornerRadius:isRound ? r.size.width / 2 : 10].CGPath;
                   _shape[k].fillColor = [UIColor colorWithWhite:1.0 alpha:_down[k] ? 0.4 : 0.08].CGColor;
+                  _shown[k] = _down[k];
                   _text[k].fontSize = fs;
                   _text[k].frame = CGRectMake(r.origin.x, r.origin.y + (r.size.height - fs * 1.25) / 2, r.size.width, fs * 1.3);
                   if (K->kind == K_MODE) {
@@ -1285,6 +1315,7 @@ jobs:
                   _stickBase.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - Rs, c.y - Rs, 2 * Rs, 2 * Rs)].CGPath;
                   _stickThumb.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x + dx - Rs * 0.5, c.y + dy - Rs * 0.5, Rs, Rs)].CGPath;
                   _stickThumb.fillColor = [UIColor colorWithWhite:1.0 alpha:active ? 0.35 : 0.15].CGColor;
+                  _stickShown = active;
               }
               /* gear and eye: always there, a little fainter */
               _gearShape.path = [UIBezierPath bezierPathWithRoundedRect:_gear cornerRadius:_gear.size.width / 2].CGPath;
@@ -1303,6 +1334,38 @@ jobs:
               _doneText.frame = CGRectMake(_done.origin.x, _done.origin.y + (_done.size.height - _u * 0.45) / 2, _done.size.width, _u * 0.5);
               _banner.fontSize = _u * 0.3;
               _banner.frame = CGRectMake(w * 0.2, h / 2 - 1.4 * _u, w * 0.6, _u * 0.9);
+              [CATransaction commit];
+          }
+
+          /* What a touch changes, and nothing else: the pressed keys' fill and the stick's ring and thumb. (A full refresh makes
+             every path again: on the game's own thread, every touch event, that is time taken from the frame.) */
+          - (void)refreshState {
+              BOOL active = _stickTouch != nil;
+              int k;
+
+              [CATransaction begin];
+              [CATransaction setDisableActions:YES];
+              for (k = 0; k < N_KEYS; k++) {
+                  if (_down[k] != _shown[k]) {
+                      _shown[k] = _down[k];
+                      _shape[k].fillColor = [UIColor colorWithWhite:1.0 alpha:_down[k] ? 0.4 : 0.08].CGColor;
+                  }
+              }
+              if (active || _stickShown) {
+                  CGFloat Rs = [self stickRadius];
+                  CGPoint c = active ? _stickCtr : _ctr[E_STICK];
+                  CGFloat dx = active ? _stickPos.x - c.x : 0, dy = active ? _stickPos.y - c.y : 0, mag = hypot(dx, dy);
+
+                  if (mag > Rs) {
+                      dx *= Rs / mag;
+                      dy *= Rs / mag;
+                  }
+                  _stickBase.opacity = _stickThumb.opacity = _floating && !active && !_editing ? _alpha * 0.45 : _alpha;
+                  _stickBase.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x - Rs, c.y - Rs, 2 * Rs, 2 * Rs)].CGPath;
+                  _stickThumb.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(c.x + dx - Rs * 0.5, c.y + dy - Rs * 0.5, Rs, Rs)].CGPath;
+                  _stickThumb.fillColor = [UIColor colorWithWhite:1.0 alpha:active ? 0.35 : 0.15].CGColor;
+                  _stickShown = active;
+              }
               [CATransaction commit];
           }
 
@@ -1378,6 +1441,7 @@ jobs:
 
           - (void)update:(UIEvent *)event {
               BOOL now[N_KEYS] = {0};
+              BOOL modeChanged = NO;
               unsigned bits = 0;
               int k, lx = 0x80, ly = 0x80;
 
@@ -1412,6 +1476,7 @@ jobs:
                           _dpadMode = !_dpadMode;
                           _stickTouch = nil;
                           [self saveSettings];
+                          modeChanged = YES;
                       }
                   }
                   if (now[k] && kKeys[k].kind == K_BUTTON) {
@@ -1423,13 +1488,41 @@ jobs:
               _lx = MAX(0, MIN(255, lx));
               _ly = MAX(0, MIN(255, ly));
               [self publish];
-              [self refresh];
+              if (modeChanged) {
+                  [self refresh];
+              } else {
+                  [self refreshState];
+              }
           }
 
           /* ---------------------------------------------------------------------------------------------- touches */
+          /* How long a press waited before this view saw it (the touch's own time against now): it waits for the game's thread to
+             take the events. Logged every ten seconds, "touch: N presses, ...", to see where a delay is. */
+          static void note_delivery(UITouch *t) {
+              static double sum, max, since;
+              static int n;
+              double now = CACurrentMediaTime(), lag = (now - t.timestamp) * 1000.0;
+
+              sum += lag;
+              n++;
+              if (lag > max) {
+                  max = lag;
+              }
+              if (since == 0) {
+                  since = now;
+              }
+              if (now - since > 10.0) {
+                  fprintf(stderr, "bt3: touch: %d presses in %.0f s, seen %.1f ms after the touch on average (worst %.1f ms)\n", n, now - since, sum / n, max);
+                  sum = max = 0;
+                  n = 0;
+                  since = now;
+              }
+          }
+
           - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
               for (UITouch *t in touches) {
                   CGPoint p = [t locationInView:self];
+                  note_delivery(t);
                   if (CGRectContainsPoint(_gear, p)) {
                       _gearTouch = t;
                   } else if (CGRectContainsPoint(_eye, p)) {
