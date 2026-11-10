@@ -1,3 +1,13 @@
+# Port para iOS: variante ios64 do projeto, o motor para iOS arm64 e, no marco 2, o app BT3.ipa (entrada pelo SDL,
+# janela alinhada propria e espelho do programa: plat_ios.c). Artefato "BT3-ipa": instale pelo SideStore.
+#
+# Salve como .github/workflows/ios.yml e rode em Actions -> ios -> Run workflow.
+# Nao precisa editar nenhum arquivo do projeto: o passo "Aplicar as mudancas" cria a variante ios64
+# (toolchain.py, undefined.py, link.py) e para com uma mensagem clara se alguma ancora nao for encontrada.
+#
+# O que ele faz: SDL3 para iOS a partir do codigo-fonte (mesma versao do Homebrew), depois o mesmo
+# caminho do macos.yml (undefined.py + link.py) com o alvo arm64-apple-ios14.0 e o SDK do iPhone.
+# Sem ISO (BT3_SKELETON=1). Se algum passo falhar, baixe o artefato "logs" ou mande a captura do passo.
 name: ios
 
 on:
