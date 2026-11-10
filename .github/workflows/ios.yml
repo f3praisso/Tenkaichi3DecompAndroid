@@ -145,6 +145,20 @@ jobs:
                '#ifdef __APPLE__\n        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);\n#else\n        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);\n#endif'),
           ])
 
+          # salvar: o motor (plat_mc.c) responde ao jogo sem dizer nada; o log passa a dizer o que o cartao de memoria recebe e responde
+          edit("port/src/plat_mc.c", [
+              ('#include <dirent.h>\n', '#include <dirent.h>\n#include <errno.h>\n'),
+              ('static int request(int cmd, int result) {\n    sLastCmd = cmd;',
+               'static int request(int cmd, int result) {\n    static int sLogged;\n    if (sLogged < 80) { /* (the log is what says why a save did not work) */\n        sLogged++;\n        fprintf(stderr, "bt3: memory card: request %d -> %d\\n", cmd, result);\n    }\n    sLastCmd = cmd;'),
+              ('    if (f == NULL) {\n        return request(2, -4);\n    }',
+               '    if (f == NULL) {\n        fprintf(stderr, "bt3: memory card: cannot open %s (errno %d: %s)\\n", path, errno, strerror(errno));\n        return request(2, -4);\n    }'),
+          ])
+          # audio: a sessao de audio do miniaudio no iOS e "play and record" por padrao, que toma o som do aparelho; "ambient" mistura
+          edit("port/src/gs/snd_ma.c", [
+              ('        if (ma_engine_init(NULL, &sEngine) == MA_SUCCESS) {',
+               '        ma_engine_config ec = ma_engine_config_init();\n        static ma_context sCtx;\n        ma_context_config cc = ma_context_config_init();\n        /* iOS: "ambient" mixes with what the phone is playing and follows the silent switch (the default session takes the sound over) */\n        cc.coreaudio.sessionCategory = ma_ios_session_category_ambient;\n        cc.coreaudio.sessionCategoryOptions = ma_ios_session_category_option_mix_with_others;\n        if (ma_context_init(NULL, 0, &cc, &sCtx) == MA_SUCCESS) {\n            ec.pContext = &sCtx;\n        }\n        if (ma_engine_init(&ec, &sEngine) == MA_SUCCESS) {'),
+          ])
+
           # contorno: o libclang 18 nao honra __ptr32 no arm64, e o leitor de tela tem static_assert de layout com ponteiros
           a11y = ROOT / "port/src/a11y_game.c"
           if a11y.exists():
@@ -187,7 +201,9 @@ jobs:
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
+          #include <errno.h>
           #include <sys/mman.h>
+          #include <sys/stat.h>
           #include <unistd.h>
 
           #define say(...) fprintf(stderr, __VA_ARGS__)
@@ -228,11 +244,16 @@ jobs:
              twice the last line counts). The iOS defaults are put there once: the first time the file has no `ios_defaults`
              line they are added to the end (which wins over a value the engine saved before it knew them), and from then on the
              player's own choices in the settings window are left alone. */
+          static const char *settings_path(void) {
+              const char *p = getenv("BT3_SETTINGS");
+              return p != NULL && p[0] != 0 ? p : "bt3_settings.txt";
+          }
+
           static int has_setting(const char *name) {
               char line[160];
               size_t n = strlen(name);
               int found = 0;
-              FILE *f = fopen("bt3_settings.txt", "r");
+              FILE *f = fopen(settings_path(), "r");
 
               while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
                   if (strncmp(line, name, n) == 0 && line[n] == '=') {
@@ -251,9 +272,33 @@ jobs:
               if (has_setting("ios_defaults")) {
                   return;
               }
-              if ((f = fopen("bt3_settings.txt", "a")) != NULL) {
+              if ((f = fopen(settings_path(), "a")) != NULL) {
                   fputs("\nlate_input=1\nios_defaults=1\n", f);
                   fclose(f);
+              }
+          }
+
+          /* The folder of the memory card: made here, and a file written and removed in it, so the log says whether the app's
+             folder takes saves at all (the game says only "cannot save"). */
+          static void check_saves(void) {
+              const char *root = getenv("BT3_SAVES");
+              char dir[1100], test[1200];
+              FILE *f;
+
+              if (root == NULL) {
+                  return;
+              }
+              snprintf(dir, sizeof(dir), "%s/card1", root);
+              mkdir(root, 0755);
+              mkdir(dir, 0755);
+              snprintf(test, sizeof(test), "%s/.write_test", dir);
+              if ((f = fopen(test, "wb")) != NULL) {
+                  fputs("ok", f);
+                  fclose(f);
+                  remove(test);
+                  say("bt3: saves folder %s: can be written\n", dir);
+              } else {
+                  say("bt3: saves folder %s: CANNOT be written (errno %d: %s)\n", dir, errno, strerror(errno));
               }
           }
 
@@ -281,7 +326,17 @@ jobs:
               /* "Low input lag" (F1 > Video in the engine's settings window): the wait for a picture is made just before the pads
                  are read, and one picture at most is on its way to the screen. Off in the engine; on here, where the buttons are
                  on glass: a press then waits a picture less to reach the game. Turned off in the settings window, it stays off. */
+              /* where the engine keeps what is the player's, by absolute path: not the current directory's business */
+              snprintf(data, sizeof(data), "%s/Documents/saves", home);
+              setenv("BT3_SAVES", data, 0);
+              snprintf(data, sizeof(data), "%s/Documents/bt3_settings.txt", home);
+              setenv("BT3_SETTINGS", data, 0);
+              /* SDL's audio session on iOS: "ambient" mixes with what the phone is already playing (music, a podcast) and
+                 follows the silent switch; SDL's default, "playback", takes the sound over. (An SDL hint, read from the
+                 environment too.) */
+              setenv("SDL_AUDIO_CATEGORY", "ambient", 0);
               seed_defaults();
+              check_saves();
           }
 
           /* ---- the program's own load commands */
@@ -1306,6 +1361,7 @@ jobs:
               CAShapeLayer *_stickBase, *_stickThumb, *_gearShape, *_eyeShape, *_doneShape, *_veil;
               CATextLayer *_gearText, *_eyeText, *_doneText, *_banner;
               /* state */
+              BOOL _menuUp; /* the gear's menu is on the screen */
               BOOL _down[N_KEYS];
               BOOL _shown[N_KEYS]; /* what the layers show of _down */
               BOOL _stickShown;
@@ -1803,51 +1859,59 @@ jobs:
           - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self finish:touches withEvent:event cancelled:YES]; }
 
           /* ---------------------------------------------------------------------------------------------- the gear's menu */
+          /* an action of the menu: it says the menu is gone, then does its work */
+          - (UIAlertAction *)act:(NSString *)title style:(UIAlertActionStyle)style do:(void (^)(void))work {
+              return [UIAlertAction actionWithTitle:title style:style handler:^(UIAlertAction *a) {
+                  self->_menuUp = NO;
+                  if (work != nil) {
+                      work();
+                  }
+              }];
+          }
+
           - (void)showMenu {
               UIViewController *vc = self.window.rootViewController;
               UIAlertController *ac;
+              UIAlertActionStyle normal = UIAlertActionStyleDefault;
 
-              [self releaseAll];
-              while (vc.presentedViewController != nil) {
-                  vc = vc.presentedViewController;
-              }
-              if (vc == nil) {
+              if (_menuUp || vc == nil || vc.presentedViewController != nil) { /* one menu at a time */
                   return;
               }
+              [self releaseAll];
               ac = [UIAlertController alertControllerWithTitle:@"Controles na tela"
                                                        message:[NSString stringWithFormat:@"Tamanho %d%%   Opacidade %d%%", (int)lroundf(_scale * 100), (int)lroundf(_alpha * 100)]
                                                 preferredStyle:UIAlertControllerStyleAlert];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Editar posições" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Editar posições" style:normal do:^{
                   self->_editing = YES;
                   self->_hidden = NO;
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Botões maiores" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Botões maiores" style:normal do:^{
                   self->_scale = MIN(1.8f, self->_scale + 0.1f);
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Botões menores" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Botões menores" style:normal do:^{
                   self->_scale = MAX(0.5f, self->_scale - 0.1f);
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Mais opacos" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Mais opacos" style:normal do:^{
                   self->_alpha = MIN(1.0f, self->_alpha + 0.1f);
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Mais transparentes" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Mais transparentes" style:normal do:^{
                   self->_alpha = MAX(0.2f, self->_alpha - 0.1f);
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:_floating ? @"Analógico fixo" : @"Analógico flutuante" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:_floating ? @"Analógico fixo" : @"Analógico flutuante" style:normal do:^{
                   self->_floating = !self->_floating;
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Restaurar o padrão" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+              [ac addAction:[self act:@"Restaurar o padrão" style:UIAlertActionStyleDestructive do:^{
                   int e;
                   for (e = 0; e < E_COUNT; e++) {
                       self->_isCustom[e] = NO;
@@ -1859,7 +1923,8 @@ jobs:
                   [self saveSettings];
                   [self refresh];
               }]];
-              [ac addAction:[UIAlertAction actionWithTitle:@"Fechar" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[self act:@"Fechar" style:UIAlertActionStyleCancel do:nil]];
+              _menuUp = YES;
               [vc presentViewController:ac animated:YES completion:nil];
           }
           @end
@@ -1910,7 +1975,7 @@ jobs:
               dispatch_async(dispatch_get_main_queue(), ^{
                   [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *timer) {
                       UIWindow *win = game_window();
-                      BOOL overlay;
+                      BOOL overlay, modal;
                       if (win == nil) {
                           return;
                       }
@@ -1919,13 +1984,14 @@ jobs:
                           fprintf(stderr, "bt3: low input lag: %s\n", Port_LateInput() ? "on" : "off");
                       }
                       tune_metal(win);
+                      modal = win.rootViewController.presentedViewController != nil; /* the gear's menu, the Files picker... */
                       if (sPad.superview != win) {
                           [win addSubview:sPad];
                           sPad.frame = win.bounds;
-                      } else {
-                          [win bringSubviewToFront:sPad];
+                      } else if (!modal) {
+                          [win bringSubviewToFront:sPad]; /* (not above a menu: its buttons would go on being touched) */
                       }
-                      overlay = gPortOverlayOpen != 0;
+                      overlay = gPortOverlayOpen != 0 || modal;
                       if (overlay && !sPad.hidden) {
                           [sPad releaseAll];
                       }
