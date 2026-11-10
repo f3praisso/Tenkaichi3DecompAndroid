@@ -14,10 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Maquina do build (macos-15, ou macos-14 se a macos-15 estiver lotada)"
+        description: "Maquina do build (macos-15 e a testada; macos-26 so se a macos-15 estiver lotada: a macos-14 foi desativada em 2/11/2026)"
         default: "macos-15"
         type: choice
-        options: [macos-15, macos-14]
+        options: [macos-15, macos-26]
 
 concurrency:
   group: ios-${{ github.ref }}
