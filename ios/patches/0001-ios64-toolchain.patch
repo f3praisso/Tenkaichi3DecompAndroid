@@ -1,0 +1,106 @@
+# Variante ios64 do toolchain: alvo arm64-apple-ios, SDK do iPhone, shaders em MSL para iOS e o link do app (sem chained fixups).
+--- a/port/tools/toolchain.py
++++ b/port/tools/toolchain.py
+@@ -16,11 +16,12 @@
+ ROOT = pathlib.Path(__file__).resolve().parents[2]
+ VARIANT = os.environ.get("BT3_CC", "gcc")
+ WIN = VARIANT == "win64"
+-MAC = VARIANT == "mac64"
+-BITS64 = VARIANT in ("clang64", "win64", "mac64")
++IOS = VARIANT == "ios64"
++MAC = VARIANT in ("mac64", "ios64")
++BITS64 = VARIANT in ("clang64", "win64", "mac64", "ios64")
+ ON_WINDOWS = os.name == "nt" or sys.platform in ("msys", "cygwin")
+ PREFIX = "x86_64-w64-mingw32-" if WIN and not ON_WINDOWS else ""
+-MAC_TRIPLE = "arm64-apple-macos11"
++MAC_TRIPLE = "arm64-apple-ios14.0" if IOS else "arm64-apple-macos11"
+ LLVM = pathlib.Path(os.environ.get("BT3_LLVM", "/opt/homebrew/opt/llvm/bin")) if MAC else None
+ 
+ def llvm(tool):
+@@ -28,13 +29,13 @@
+     return str(LLVM / tool) if MAC else tool
+ 
+ def mac_sdk():
+-    return subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
++    return subprocess.run(["xcrun"] + (["--sdk", "iphoneos"] if IOS else []) + ["--show-sdk-path"], capture_output=True, text=True).stdout.strip()
+ 
+ CLANG_TARGET = ["--target=x86_64-w64-mingw32"] if WIN else [f"--target={MAC_TRIPLE}", "-isysroot", mac_sdk()] if MAC else []
+ OBJ = ROOT / ("port/build/obj" if VARIANT == "gcc" else "port/build/obj_" + VARIANT)
+ DATA = ROOT / ("port/build/obj_data" if not BITS64 else "port/build/obj_data_win64" if WIN else
+-               "port/build/obj_data_mac64" if MAC else "port/build/obj_data64")
+-EXE = ROOT / "port/build" / {"gcc": "bt3", "clang64": "bt3_64", "win64": "bt3.exe", "mac64": "bt3_mac"}.get(VARIANT, "bt3_" + VARIANT)
++               "port/build/obj_data_ios64" if IOS else "port/build/obj_data_mac64" if MAC else "port/build/obj_data64")
++EXE = ROOT / "port/build" / {"gcc": "bt3", "clang64": "bt3_64", "win64": "bt3.exe", "mac64": "bt3_mac", "ios64": "bt3_ios"}.get(VARIANT, "bt3_" + VARIANT)
+ 
+ def sdl3():
+     """The folder with SDL3's include/ and lib/ for the Windows build, or None when the compiler finds it itself."""
+--- a/port/tools/undefined.py
++++ b/port/tools/undefined.py
+@@ -8,7 +8,7 @@
+ 
+ ROOT = pathlib.Path(__file__).resolve().parents[2]
+ # The build variants (BT3_CC): see toolchain.py.
+-from toolchain import VARIANT, WIN, MAC, BITS64, PREFIX, CLANG_TARGET, OBJ, DATA, sdl3, llvm
++from toolchain import VARIANT, WIN, MAC, IOS, MAC_TRIPLE, BITS64, PREFIX, CLANG_TARGET, OBJ, DATA, sdl3, llvm
+ 
+ # macOS / arm64: x86 code-generation flags have no meaning there. Software float is not a front-end option on arm64:
+ # the IR is made as usual and the code generator is told there is no floating-point unit (llc -mattr, below), which
+@@ -19,14 +19,14 @@
+              "-Wno-error=int-conversion", "-Wno-error=incompatible-pointer-types", "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int"]
+ MAC_IR = ["-Xclang", "-disable-llvm-passes"]  # the window pass sees the code as written ((u32)p is still a ptrtoint and a
+ # trunc, not folded into a shift or a mask); macwin.run optimises after it
+-MAC_LLC = ["-mtriple=arm64-apple-macos11", "-mattr=-fp-armv8,-neon", "-relocation-model=pic"]
++MAC_LLC = [f"-mtriple={MAC_TRIPLE}", "-mattr=-fp-armv8,-neon", "-relocation-model=pic"]
+ 
+ def variant(cmd):
+     """The command for this build variant: clang for everything built with software float, 64-bit or Windows flags."""
+     if MAC:
+         soft = "-msoft-float" in cmd
+         cc = llvm("clang++" if cmd[0] == "g++" else "clang") if soft else ("clang++" if cmd[0] == "g++" else "clang")
+-        target = CLANG_TARGET if soft else ["-arch", "arm64", "-mmacosx-version-min=11.0", f"-I{os.environ.get('BT3_SDL3', '/opt/homebrew/opt/sdl3')}/include"]
++        target = CLANG_TARGET if soft else (["-arch", "arm64", "-isysroot", CLANG_TARGET[-1], "-miphoneos-version-min=14.0"] if IOS else ["-arch", "arm64", "-mmacosx-version-min=11.0"]) + [f"-I{os.environ.get('BT3_SDL3', '/opt/homebrew/opt/sdl3')}/include"]
+         return [cc] + target + [a for a in cmd[1:] if a not in MAC_DROP] + (["-fms-extensions"] + MAC_FLAGS if soft else [])
+     if BITS64:
+         cmd = ["-m64" if a == "-m32" else a for a in cmd if a != "-malign-double"]
+@@ -212,7 +212,7 @@
+         arrays.append(f"static const unsigned char {name}[] = {{" + ",".join(str(b) for b in spv.read_bytes()) + "};\n")
+         if MAC:  # SDL_GPU's Metal back end takes MSL: the same shader translated (bindings as numbered: SDL's Metal slots)
+             msl = gen / (src.name + ".msl")
+-            r = subprocess.run(["spirv-cross", "--msl", "--msl-version", "20100", "--msl-decoration-binding", str(spv), "--output", str(msl)],
++            r = subprocess.run(["spirv-cross", "--msl"] + (["--msl-ios"] if IOS else []) + ["--msl-version", "20100", "--msl-decoration-binding", str(spv), "--output", str(msl)],
+                                capture_output=True, text=True)
+             if r.returncode:
+                 print("FAILED shader (MSL)", src.name, r.stderr[:300])
+--- a/port/tools/link.py
++++ b/port/tools/link.py
+@@ -6,7 +6,7 @@
+ 
+ import sys
+ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+-from toolchain import ROOT, VARIANT, WIN, MAC, PREFIX, OBJ, DATA, EXE, sdl3
++from toolchain import ROOT, VARIANT, WIN, MAC, IOS, mac_sdk, PREFIX, OBJ, DATA, EXE, sdl3
+ 
+ B = ROOT / "port/build"
+ 
+@@ -47,7 +47,21 @@
+     moved = [f"-Wl,-segaddr,{s},{MAC_BASE + a - first:#x}" for s, a, _ in segs if s != "__LINKEDIT"]
+     return subprocess.run(cmd + moved, capture_output=True, text=True)
+ 
++IOS_FRAMEWORKS = ["Foundation", "UIKit", "Metal", "QuartzCore", "CoreGraphics", "CoreMotion", "CoreHaptics", "AVFoundation",
++                  "AVFAudio", "AudioToolbox", "CoreAudio", "CoreFoundation", "GameController", "CoreBluetooth", "CoreMedia",
++                  "CoreVideo", "ImageIO", "UniformTypeIdentifiers", "OpenGLES"]
++
++def link_ios(objs, extra):
++    """iOS arm64: one pass, SDL3 built for iOS (static), the frameworks it needs, no moved segments (the window is separate)."""
++    sdl = os.environ["BT3_SDL3"]
++    fw = [a for f in IOS_FRAMEWORKS for a in ("-framework", f)]
++    cmd = ["clang", "-arch", "arm64", "-isysroot", mac_sdk(), "-miphoneos-version-min=14.0", "-w", "-o", str(EXE)] + extra + objs + \
++          [f"-L{sdl}/lib", "-lSDL3", "-lc++"] + fw + ["-Wl,-no_fixup_chains", "-Wl,-e,___wrap_main", "-Wl,-export_dynamic", f"-Wl,-map,{EXE}.map"]  # (formato antigo de relocacao: o ld recente quebra com as chained fixups)
++    return subprocess.run(cmd, capture_output=True, text=True)
++
+ def link(objs, extra):
++    if IOS:
++        return link_ios(objs, extra)
+     if MAC:
+         return link_mac(objs, extra)
+     common = ["-Wl,--defsym=D_3BE71C=0x3BE71C", "-Wl,--wrap=Progress_Main", f"-Wl,-Map={EXE}.map"]

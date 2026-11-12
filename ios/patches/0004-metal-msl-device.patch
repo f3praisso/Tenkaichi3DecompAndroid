@@ -1,0 +1,15 @@
+# No Apple o dispositivo SDL_GPU pede shaders MSL (Metal), nao SPIR-V.
+--- a/port/src/gs/gs_gpu.c
++++ b/port/src/gs/gs_gpu.c
+@@ -827,7 +827,11 @@
+     {   /* SDL's Vulkan device asks for features some GPUs lack (Mali: depthClamp, drawIndirectFirstInstance, ...);
+            without them, the same device with those features off (depth clipping instead of clamping) */
+         SDL_PropertiesID props = SDL_CreateProperties();
++#ifdef __APPLE__
++        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
++#else
+         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
++#endif
+         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, getenv("BT3_GPU_DEBUG") != NULL);
+         sDev = getenv("BT3_GPU_LITE") != NULL ? NULL : SDL_CreateGPUDeviceWithProperties(props);
+         if (sDev == NULL) {

@@ -1,0 +1,21 @@
+# Cartao de memoria: um erro de verdade ao abrir um arquivo vai para o log ("nao existe" e normal e nao conta).
+--- a/port/src/plat_mc.c
++++ b/port/src/plat_mc.c
+@@ -19,6 +19,7 @@
+  * The names are the library's addresses in the PS2 executable; the game sources #define the sce names onto them.
+  */
+ #include <dirent.h>
++#include <errno.h>
+ #include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -121,6 +122,9 @@
+         f = fopen(path, "w+b");
+     }
+     if (f == NULL) {
++        if (errno != ENOENT) {
++            fprintf(stderr, "bt3: memory card: cannot open %s (errno %d: %s)\n", path, errno, strerror(errno));
++        }
+         return request(2, -4);
+     }
+     if (sHost[fd] != NULL) {

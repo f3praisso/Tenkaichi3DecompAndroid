@@ -1,0 +1,66 @@
+# A janela de 4 GB no iOS: PORT_WINDOW passa a ser a variavel Port_Window (alinhada, reservada em plat_ios.c), regioes com MAP_FIXED dentro dela, Port_GameEntry e Port_MapMemory chamados de dentro do espelho.
+--- a/port/src/port_addr.h
++++ b/port/src/port_addr.h
+@@ -14,8 +14,14 @@
+ #include <stdint.h>
+ 
+ #ifdef __APPLE__
++#include <TargetConditionals.h>
+ #include <mach-o/ldsyms.h> /* _mh_execute_header: the program's first byte */
++#if TARGET_OS_IPHONE
++extern void *Port_Window; /* iOS: a window of its own, aligned (plat_ios.c) */
++#define PORT_WINDOW ((uintptr_t)Port_Window)
++#else
+ #define PORT_WINDOW ((uintptr_t)&_mh_execute_header - 0x20000000u)
++#endif
+ static inline void *Port_Ptr(uint32_t addr) {
+     return addr != 0 ? (void *)(PORT_WINDOW + addr) : (void *)0;
+ }
+--- a/port/src/plat_mem.c
++++ b/port/src/plat_mem.c
+@@ -194,6 +194,12 @@
+        thread.
+    The entry point of the program is __wrap_main (link.py: ld64 has no --wrap; the game's main() is called by
+    name). */
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#define PORT_MAP_FIXED MAP_FIXED /* iOS: the window is reserved by plat_ios.c; these regions replace parts of it */
++#else
++#define PORT_MAP_FIXED 0
++#endif
+ #include <crt_externs.h>
+ #include <mach-o/dyld.h>
+ #include <spawn.h>
+@@ -232,7 +238,7 @@
+ static void *map_at(uint32_t addr, uint32_t size) {
+     uintptr_t page = (uintptr_t)getpagesize(), at = (PORT_WINDOW + addr) & ~(page - 1);
+     size_t n = (size_t)((PORT_WINDOW + addr + size - at + page - 1) & ~(page - 1));
+-    void *p = mmap((void *)at, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    void *p = mmap((void *)at, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | PORT_MAP_FIXED, -1, 0);
+ 
+     if (p != (void *)at) {
+         if (p != MAP_FAILED) {
+@@ -271,7 +277,11 @@
+     sResult = main(sArgc, sArgv);
+ }
+ 
++#if TARGET_OS_IPHONE
++int Port_GameEntry(int argc, char **argv) { /* (the process's entry is __wrap_main in plat_ios.c) */
++#else
+ int __wrap_main(int argc, char **argv) {
++#endif
+     sArgc = argc;
+     sArgv = argv;
+     sGameStackTop = (uint8_t *)Port_Ptr(STACK_BASE + STACK_SIZE);
+@@ -673,7 +683,11 @@
+ static void low_region_take(void);
+ #endif
+ int gPortScratchpadMapped; /* gs/state.c: the scratchpad is mapped at 0x70000000 (Android: only if that was free) */
++#if TARGET_OS_IPHONE
++void Port_MapMemory(void) { /* iOS: called from the mirror (plat_ios.c), not at load */
++#else
+ __attribute__((constructor)) static void Port_MapMemory(void) {
++#endif
+ #ifdef _WIN32
+     /* The program only works at the address it was linked for (the game's pointers are 4 bytes and absolute). It
+        carries no relocation table, so Windows has to load it there; should it be somewhere else all the same (a

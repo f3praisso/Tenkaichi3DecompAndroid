@@ -1,0 +1,13 @@
+# Apple: o libclang 18 (a leitura do ptr32.py) nao honra __ptr32 no arm64, entao os static_assert de layout do leitor de tela, que contam ponteiros de 4 bytes, nao valem nessa leitura.
+--- a/port/src/a11y_game.c
++++ b/port/src/a11y_game.c
+@@ -11,6 +11,9 @@
+  * include/; the port's files do not include the game's headers).
+  */
+ #include <stddef.h>
++#ifdef __APPLE__ /* ptr32.py parses with libclang 18, where __ptr32 is not 4 bytes on arm64: the layout checks below do not hold there */
++#define _Static_assert(...)
++#endif
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
