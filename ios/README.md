@@ -10,7 +10,9 @@ ios/
     gs/ios_setup.c    o disco (.iso) para gamedata/: lê ISO 9660 e divide os AFS (sem tela)
     gs/ios_setup.h    a estrutura de progresso, compartilhada com a tela
     gs/ios_setup_ui.c a tela de preparação dos dados (UIKit, seletor de arquivos)
-    gs/ios_touch.c    o controle na tela (UIKit): analógico, botões, menu da engrenagem
+    gs/ios_touch.c    o controle na tela (UIKit), no visual e com os botões do app Android: analógico em orbe, botões
+                      com ícones e etiquetas (X A B Y, LB LT RB RT, L3 R3), especiais (L2 + botão), trocar e escolher
+                      membro, layout de menu e de luta (troca sozinho), menu da engrenagem (tamanho, opacidade, posições)
   patches/          as mudanças em arquivos que já existiam (git apply, em ordem)
   scripts/          apply.sh (aplica), package.sh (monta o BT3.ipa), make_icon.py, Info.plist
 ```
@@ -27,7 +29,8 @@ ios/
 - **Gráficos.** SDL_GPU com Metal; shaders em MSL gerados pelo spirv-cross (`--msl-ios`).
 - **Dados.** O motor lê o disco desempacotado em `Documents/gamedata` (o que o `extract_disc.py` faz num PC).
   `ios_setup*.c` faz isso no aparelho, a partir de um `.iso` escolhido no seletor de arquivos ou colocado na pasta do app.
-- **Controle.** `ios_touch.c` usa o `Port_TouchPad` que o motor já tem para o Android.
+- **Controle.** `ios_touch.c` usa o `Port_TouchPad` que o motor já tem para o Android. O layout troca sozinho entre
+  menu (D-pad) e luta (analógico e ataques) pela variável `gPortInMenus`; o botão de layout troca à mão.
 - **Áudio.** Sessão `ambient` (mistura com o que o aparelho já toca).
 
 ## Os patches (`ios/patches`)
