@@ -936,7 +936,7 @@ static NSArray *grad_colors(BOOL pressed) {
             }
         }
         if (now[k] && kKeys[k].kind == K_BUTTON) {
-            bits |= kKeys[k].bit;
+            bits |= kKeys[k].bits;
         }
         _down[k] = now[k];
     }
