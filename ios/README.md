@@ -14,6 +14,8 @@ ios/
                       com ícones e etiquetas (X A B Y, LB LT RB RT, L3 R3), especiais (L2 + botão), trocar e escolher
                       membro, layout de menu e de luta (troca sozinho), menu da engrenagem (tamanho, opacidade, posições)
   patches/          as mudanças em arquivos que já existiam (git apply, em ordem)
+  icon/             o ícone do app, em 120 e 180 pixels (se esta pasta tiver os dois PNGs, o package.sh os usa; se for
+                    apagada, o ícone "BT3" é gerado por scripts/make_icon.py)
   scripts/          apply.sh (aplica), package.sh (monta o BT3.ipa), make_icon.py, Info.plist
 ```
 

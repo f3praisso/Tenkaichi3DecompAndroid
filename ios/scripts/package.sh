@@ -15,12 +15,19 @@ done
 cp -R port/translations "$APP/translations"
 cp ios/scripts/Info.plist "$APP/Info.plist"
 
-# o icone: gerado aqui (nada de arte do jogo), em 120 e 180 pixels
-PY="${PY:-.venv/bin/python}"
-[ -x "$PY" ] || PY=python3
-"$PY" -m pip install --quiet --disable-pip-version-check pillow
-"$PY" ios/scripts/make_icon.py icon
-cp icon/AppIcon60x60@2x.png icon/AppIcon60x60@3x.png "$APP/"
+# o icone: o que estiver em ios/icon (120 e 180 pixels, PNG sem transparencia); se nao houver, um gerado aqui (BT3, sem
+# arte do jogo)
+if [ -f ios/icon/AppIcon60x60@2x.png ] && [ -f ios/icon/AppIcon60x60@3x.png ]; then
+  cp ios/icon/AppIcon60x60@2x.png ios/icon/AppIcon60x60@3x.png "$APP/"
+  echo "icone: o de ios/icon"
+else
+  PY="${PY:-.venv/bin/python}"
+  [ -x "$PY" ] || PY=python3
+  "$PY" -m pip install --quiet --disable-pip-version-check pillow
+  "$PY" ios/scripts/make_icon.py icon
+  cp icon/AppIcon60x60@2x.png icon/AppIcon60x60@3x.png "$APP/"
+  echo "icone: o BT3 gerado"
+fi
 
 (cd ipa && zip -qr ../BT3.ipa Payload)
 ls -la BT3.ipa "$APP"
